@@ -155,6 +155,14 @@ local function builtin_shape(b, profile)
    cols[#cols + 1] = "k INT NOT NULL"
    fixed = fixed + FIXED_BYTES.k
 
+   -- pk_secondary（§4.2）= 主键 + 二级索引 + **唯一索引**。
+   -- 唯一索引必须有天然唯一的列：`k` 取 (id*7) % 100000、>10 万行就会撞，
+   -- 所以另加一列 u（= id*1000003，逐行唯一），别拿会撞的列去建 UNIQUE。
+   if profile == "pk_secondary" then
+      cols[#cols + 1] = "u BIGINT NOT NULL"
+      fixed = fixed + 8
+   end
+
    local target = 0
    if b > 0 then
       target = b - fixed
@@ -170,12 +178,23 @@ local function builtin_shape(b, profile)
                          target = target}
    end
 
+   -- INSERT 的列名表由**形状**决定，别再硬编码（硬编码 "id,k,c" 在加列后会漏列：
+   -- 实测踩到过——表建好了、灌数整条语句报错，而外面只看 "created" 还以为成功）
+   local names = {"id", "k"}
+   if profile == "pk_secondary" then names[#names + 1] = "u" end
+   if b > 0 then names[#names + 1] = "c" end
+
    return {
       cols = cols, fixed = fixed, fill = fill, target = target,
-      idx = (profile == "pk_secondary") and "PRIMARY KEY (id), KEY k_k (k)"
-                                      or "PRIMARY KEY (id)",
+      insert_cols = table.concat(names, ","),
+      idx = (profile == "pk_secondary")
+            and "PRIMARY KEY (id), KEY k_k (k), UNIQUE KEY u_uniq (u)"
+            or "PRIMARY KEY (id)",
       values = function(id, rng, lens, i)
          local v = {tostring(id), tostring((id * 7) % 100000)}
+         if profile == "pk_secondary" then
+            v[#v + 1] = tostring(id * 1000003)
+         end
          if fill[1] ~= nil then
             v[#v + 1] = "'" .. ascii_of(rng, lens[((i - 1) % #lens) + 1], "r" .. id) .. "'"
          end
@@ -286,9 +305,10 @@ local function alltypes_shape(b, profile)
    return {
       cols = cols, fixed = fixed, fill = fill, target = target,
       var_cols = var_cols, var_bytes = var_known,
-      alltypes_cols = table.concat(names, ","),
-      idx = (profile == "pk_secondary") and "PRIMARY KEY (c_long), KEY c_tiny_k (c_tiny)"
-                                      or "PRIMARY KEY (c_long)",
+      insert_cols = table.concat(names, ","),
+      idx = (profile == "pk_secondary")
+            and "PRIMARY KEY (c_long), KEY c_tiny_k (c_tiny), UNIQUE KEY c_longlong_u (c_longlong)"
+            or "PRIMARY KEY (c_long)",
       values = function(id, rng, lens, i)
          local v = {}
          local len = (b > 0) and lens[((i - 1) % #lens) + 1] or 0
@@ -379,11 +399,9 @@ local function load_table(con, db, name, shape, row_bytes)
    local lens, target = fill_lengths((shape.fill[1] ~= nil) and shape.fill[1].target or 0,
                                      (shape.fill[1] ~= nil) and shape.fill[1].capacity or 0)
 
-   local col_names = {}
-   if shape.alltypes_cols ~= nil then
-      col_names = shape.alltypes_cols
-   else
-      col_names = (shape.fill[1] ~= nil) and "id,k,c" or "id,k"
+   local col_names = shape.insert_cols
+   if col_names == nil then
+      die("内部错误：shape 没有 insert_cols（列名表必须由形状给出）")
    end
 
    while inserted < total do
