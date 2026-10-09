@@ -55,6 +55,13 @@ typedef struct
   char          *driver;   /* Requested database driver */
   unsigned char debug;     /* debug flag */
   db_target_t   target;    /* perf-tool fork: --target 档位 */
+
+  /* perf-tool fork: 强读档（--read-consistency）。
+     服务端的闸门是 `percona_raft_read_consistency`（枚举 LINEARIZABLE/STALE，默认 STALE，
+     `sys_vars.cc:7463`），且**非 Raft 实例上设 LINEARIZABLE 会被服务端拒**
+     （`sys_vars.cc:7470-7480`：宁可报错也不静默降级）。工具侧同样不静默降级。 */
+  unsigned char read_linearizable;
+  unsigned char read_consistency_explicit;  /* 命令行是否显式指定（报告里要区分"默认"与"指定"） */
 } db_globals_t;
 
 /* Driver capabilities definition */

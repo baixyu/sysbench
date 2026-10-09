@@ -114,6 +114,7 @@ typedef struct
   unsigned char      managed_identity;   /* 身份变量存在且 namespace 已设 */
   unsigned char      txn_open;           /* 本连接当前有一笔事务开着（显式或隐式） */
   unsigned char      target_mismatch;    /* --target=raft 但服务端没有身份变量 */
+  unsigned char      read_consistency_failed;  /* 要强读但服务端设不上（非 Raft 实例） */
   unsigned long long txn_seq;            /* 本连接已开始的受管事务数 */
 } db_mysql_conn_t;
 
@@ -138,6 +139,7 @@ static unsigned long long raft_cls_ambiguous;
 static unsigned long long raft_cls_temporary;
 static unsigned long long raft_cls_needs_action;
 static unsigned long long raft_implicit_txns;      /* 驱动替脚本开的自动提交事务数 */
+static unsigned long long raft_conns_read_consistency;  /* 真正设上读契约的连接数 */
 static unsigned long long raft_cls_rolled_back_xa;
 
 static void raft_bump(unsigned long long *counter)
@@ -191,6 +193,40 @@ static void raft_setup_identity(db_mysql_conn_t *db_mysql_con)
     return;
 
   /*
+    强读档（M1-3）：**必须放在身份探测之前**。
+    先前放在"探测到身份变量"之后 ⇒ 对着没有这些变量的服务端（原生 MySQL）
+    这一段根本不执行：SET 没发、也没有报错，而报告照样打印 LINEARIZABLE
+    —— 正是本节声称要防的"静默降级"（实测踩到：43300 上一点动静都没有）。
+    服务端自己的规矩也是"宁可报错也不静默降级"（`sys_vars.cc:7470-7480`），
+    工具这一侧照同一条走：设不上就让这台连接失败。
+  */
+  if (db_globals.read_consistency_explicit)
+  {
+    char rc_sql[96];
+
+    snprintf(rc_sql, sizeof(rc_sql),
+             "SET SESSION percona_raft_read_consistency = '%s'",
+             db_globals.read_linearizable ? "LINEARIZABLE" : "STALE");
+
+    if (raft_run_sql(con, rc_sql) != 0)
+    {
+      log_text(LOG_FATAL,
+               "Percona Raft: failed to set read consistency to %s: %s.  "
+               "LINEARIZABLE needs a server started with --percona-raft-enabled; "
+               "refusing to run a strong-read arm that would silently degrade to "
+               "local reads.",
+               db_globals.read_linearizable ? "LINEARIZABLE" : "STALE",
+               mysql_error(con));
+      db_mysql_con->read_consistency_failed = 1;
+      return;
+    }
+
+    __atomic_fetch_add(&raft_conns_read_consistency, 1, __ATOMIC_RELAXED);
+    log_text(LOG_INFO, "Percona Raft: session read consistency = %s",
+             db_globals.read_linearizable ? "LINEARIZABLE" : "STALE");
+  }
+
+  /*
     --target 分档（§4.0）：
       raft  = 断言这是受管集群：探测不到身份变量就**立刻失败**——否则"跑错了目标"
               会被读成性能结论（对原生 MySQL 跑 raft 档，写语句根本不受管，
@@ -234,6 +270,7 @@ static void raft_setup_identity(db_mysql_conn_t *db_mysql_con)
   }
 
   __atomic_store_n(&raft_identity_available, 1, __ATOMIC_RELAXED);
+
 
   seq = __atomic_fetch_add(&raft_conn_seq, 1, __ATOMIC_RELAXED) + 1;
 
@@ -800,6 +837,18 @@ int mysql_drv_connect(db_conn_t *sb_conn)
     必须**返回失败**而不是记条日志继续跑——继续跑会得到一份"unmanaged 增量 0"的漂亮报告，
     而那个 0 只说明"这台根本没有那道门"（§4.0/§7.1），会被读成性能结论。
   */
+  if (db_mysql_con->read_consistency_failed)
+  {
+    log_text(LOG_FATAL, "aborting: --read-consistency could not be applied on "
+                        "host '%s', port %u",
+             db_mysql_con->host, db_mysql_con->port);
+    mysql_close(db_mysql_con->mysql);
+    free(db_mysql_con->mysql);
+    free(db_mysql_con);
+    sb_conn->ptr = NULL;
+    return 1;
+  }
+
   if (db_mysql_con->target_mismatch)
   {
     log_text(LOG_FATAL, "aborting: --target=raft requires the managed-write "
@@ -1441,6 +1490,16 @@ int mysql_drv_report_stats(void)
 
   log_text(LOG_NOTICE, "    target:                              %s",
            target_name[db_globals.target]);
+  log_text(LOG_NOTICE, "    read consistency:                    %s",
+           db_globals.read_consistency_explicit
+             ? (db_globals.read_linearizable ? "LINEARIZABLE" : "STALE")
+             : "default (未干预, 服务端默认 STALE)");
+  if (db_globals.read_consistency_explicit)
+    log_text(LOG_NOTICE, "    connections that accepted it:        %llu / %llu%s",
+             raft_conns_read_consistency, raft_conns_total,
+             raft_conns_read_consistency == raft_conns_total
+               ? ""
+               : "   <-- 有连接没设上：本次不是强读档");
   log_text(LOG_NOTICE, "    request identity injection:          %s",
            raft_identity_available
              ? "on  (server has percona_raft_request_*)"

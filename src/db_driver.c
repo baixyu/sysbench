@@ -96,6 +96,11 @@ static sb_arg_t db_args[] =
   SB_OPT("target", "target server class: {auto, raft, mysql} "
          "(raft: require the managed-write contract; mysql: native, no injection)",
          "auto", STRING),
+  /* perf-tool fork：强读档。默认 default = 不动服务端设置（STALE 是服务端默认）。
+     取 linearizable 时每连接 `SET SESSION percona_raft_read_consistency='LINEARIZABLE'`，
+     设不上就**失败**——服务端自己都不肯静默降级成普通本地读，工具更不能把它藏起来。 */
+  SB_OPT("read-consistency", "Raft read contract for SELECTs: {default, stale, linearizable}",
+         "default", STRING),
 
   SB_OPT_END
 };
@@ -773,6 +778,27 @@ int db_parse_arguments(void)
   else
   {
     log_text(LOG_FATAL, "Invalid value for target: %s (expected auto|raft|mysql)", s);
+    return 1;
+  }
+
+  s = sb_get_value_string("read-consistency");
+
+  db_globals.read_consistency_explicit = 1;
+
+  if (!strcmp(s, "default"))
+  {
+    db_globals.read_linearizable = 0;
+    db_globals.read_consistency_explicit = 0;   /* 没指定 = 不动服务端设置 */
+  }
+  else if (!strcmp(s, "linearizable"))
+    db_globals.read_linearizable = 1;
+  else if (!strcmp(s, "stale"))
+    db_globals.read_linearizable = 0;
+  else
+  {
+    log_text(LOG_FATAL,
+             "Invalid value for read-consistency: %s (expected default|stale|linearizable)",
+             s);
     return 1;
   }
   
