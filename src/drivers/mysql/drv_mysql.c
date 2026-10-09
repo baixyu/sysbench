@@ -33,6 +33,7 @@
 # include <strings.h>
 #endif
 #include <stdio.h>
+#include <unistd.h>
 
 #include <mysql.h>
 #include <mysqld_error.h>
@@ -104,7 +105,314 @@ typedef struct
   char         *db;
   unsigned int port;
   char         *socket;
+  /*
+    Percona Raft（本 fork 的用途）：受管写要求每笔事务带请求身份。
+    连接建立后探测服务端是否有 percona_raft_request_*（只有我们的构建有），
+    有则 namespace 每连接设一次（并逐连接探测：多线程下不能用"进程内只探一次"的闩锁，
+    见 raft_setup_identity() 里的说明），request_id 每笔事务换一个新值（见 raft_set_request_id()）。
+  */
+  unsigned char      managed_identity;   /* 身份变量存在且 namespace 已设 */
+  unsigned char      txn_open;           /* 本连接当前有一笔事务开着（显式或隐式） */
+  unsigned long long txn_seq;            /* 本连接已开始的受管事务数 */
 } db_mysql_conn_t;
+
+/*
+  ---- Percona Raft 身份注入与错误分栏（perf-tool fork 专有）---------------
+  依据：percona-server 的 Docs/raft_replication/perf_tool_plan.md §7.1 / §9。
+  两条规矩都由这里保证：
+    * 每笔事务的身份 = namespace（每连接一次）+ request_id（每笔换新），
+      且在 `BEGIN` 之前设好 —— 缺任何一条，受管闸门都会按 8109 拒掉整笔事务；
+    * 错误码按【数值】分栏（3098/3197/1402 与 8100-8115），不按错误文本匹配。
+  为什么放在 C 层：原版 `oltp_*.lua` 不设身份，注入放在驱动里它们才能"原样跑"
+  （实测背书：perf_tool_plan.md §7.2）。
+------------------------------------------------------------------------- */
+
+static unsigned char      raft_identity_available;   /* 有过连接探到身份变量（报告用） */
+static unsigned long long raft_conns_total;
+static unsigned long long raft_conns_with_identity;
+static unsigned int       raft_conn_seq;
+static unsigned long long raft_request_ids_issued;
+static unsigned long long raft_cls_refused;
+static unsigned long long raft_cls_ambiguous;
+static unsigned long long raft_cls_temporary;
+static unsigned long long raft_cls_needs_action;
+static unsigned long long raft_implicit_txns;      /* 驱动替脚本开的自动提交事务数 */
+static unsigned long long raft_cls_rolled_back_xa;
+
+static void raft_bump(unsigned long long *counter)
+{
+  __atomic_fetch_add(counter, 1, __ATOMIC_RELAXED);
+}
+
+/* 执行一条控制面 SQL 并吃掉结果集（身份注入用；失败只记日志） */
+static int raft_run_sql(MYSQL *con, const char *sql)
+{
+  MYSQL_RES *res;
+
+  if (mysql_query(con, sql) != 0)
+    return 1;
+
+  res = mysql_store_result(con);
+  if (res != NULL)
+    mysql_free_result(res);
+
+  return 0;
+}
+
+/* 服务端有没有身份变量（只探一次：同一进程内服务端不会变） */
+static int raft_probe_identity(MYSQL *con)
+{
+  MYSQL_RES *res;
+  int found;
+
+  if (mysql_query(con, "SHOW VARIABLES LIKE 'percona_raft_request_namespace'") != 0)
+    return 0;
+
+  res = mysql_store_result(con);
+  if (res == NULL)
+    return 0;
+
+  found = mysql_num_rows(res) > 0;
+
+  mysql_free_result(res);
+
+  return found;
+}
+
+/* 连接建立后调用：探测 + 设 namespace（每连接一次） */
+static void raft_setup_identity(db_mysql_conn_t *db_mysql_con)
+{
+  MYSQL *con = db_mysql_con->mysql;
+  char   sql[160];
+  unsigned int seq;
+
+  if (con == NULL)
+    return;
+
+  /*
+    为什么每个连接各探一次、而不是"进程内只探一次"：
+    先前用 `raft_identity_probed` 做闩锁，但它是"先发布闩锁、后写探测结果"——
+    第二个线程会看到 probed==1 而 available 仍是 0，于是**整条连接不设 namespace**，
+    它的写语句就落到服务端的"未纳管"拒绝上（8109）。多线程下这是必然踩到的竞态，
+    实测 `--threads=2` 时两个连接里只有一个拿到身份。
+    连接是每线程建一次的（不是每事务），所以每连接探一次的成本可以忽略。
+  */
+  __atomic_fetch_add(&raft_conns_total, 1, __ATOMIC_RELAXED);
+
+  if (!raft_probe_identity(con))
+  {
+    log_text(LOG_DEBUG, "Percona Raft: no percona_raft_request_* on this server; "
+                        "no identity injected (native target)");
+    return;
+  }
+
+  __atomic_store_n(&raft_identity_available, 1, __ATOMIC_RELAXED);
+
+  seq = __atomic_fetch_add(&raft_conn_seq, 1, __ATOMIC_RELAXED) + 1;
+
+  /*
+    身份分量规则（txn_envelope.h）：1..256 UTF-8 字节、不含 NUL、必须 NFC。
+    这里用纯 ASCII，天然满足；带上 pid 与连接序号，便于在服务端日志里定位。
+  */
+  snprintf(sql, sizeof(sql),
+           "SET SESSION percona_raft_request_namespace = 'perf-%u-%u'",
+           (unsigned) getpid(), seq);
+
+  if (raft_run_sql(con, sql) == 0)
+  {
+    db_mysql_con->managed_identity = 1;
+    __atomic_fetch_add(&raft_conns_with_identity, 1, __ATOMIC_RELAXED);
+  }
+  else
+    log_text(LOG_WARNING, "Percona Raft: failed to set request namespace: %s",
+             mysql_error(con));
+}
+
+/* 每笔事务开始前调用：换一个新的 request_id */
+static void raft_set_request_id(db_mysql_conn_t *db_mysql_con)
+{
+  char sql[96];
+
+  if (db_mysql_con == NULL || !db_mysql_con->managed_identity)
+    return;
+
+  snprintf(sql, sizeof(sql), "SET SESSION percona_raft_request_id = 'txn-%llu'",
+           ++db_mysql_con->txn_seq);
+
+  if (raft_run_sql(db_mysql_con->mysql, sql) == 0)
+    raft_bump(&raft_request_ids_issued);
+  else
+    log_text(LOG_WARNING, "Percona Raft: failed to set request id: %s",
+             mysql_error(db_mysql_con->mysql));
+}
+
+/* 取语句首词（小写，跳过前导空白，遇空白/分号即止）：够用于判别 BEGIN/COMMIT/写语句 */
+static void raft_first_word(const char *query, size_t len, char *word, size_t cap)
+{
+  size_t i = 0;
+  size_t n = 0;
+
+  word[0] = '\0';
+  if (query == NULL || cap < 2)
+    return;
+
+  while (i < len && (query[i] == ' ' || query[i] == '\t' ||
+                     query[i] == '\n' || query[i] == '\r'))
+    i++;
+
+  for (; i < len && n < cap - 1; i++)
+  {
+    char c = query[i];
+
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ';')
+      break;
+    if (c >= 'A' && c <= 'Z')
+      c = (char) (c - 'A' + 'a');
+    word[n++] = c;
+  }
+  word[n] = '\0';
+}
+
+/* 这条语句是不是事务开始（BEGIN / START TRANSACTION）；"START TRANSACTION" 取首词即可判别 */
+static int raft_is_txn_start(const char *query, size_t len)
+{
+  char word[16];
+
+  raft_first_word(query, len, word, sizeof(word));
+
+  return strcmp(word, "begin") == 0 || strcmp(word, "start") == 0;
+}
+
+/* 事务结束（脚本自己收尾）——用于跟踪本连接上还有没有开着的事务 */
+static int raft_is_txn_end(const char *query, size_t len)
+{
+  char word[16];
+
+  raft_first_word(query, len, word, sizeof(word));
+
+  return strcmp(word, "commit") == 0 || strcmp(word, "rollback") == 0;
+}
+
+/*
+  写语句判定：**只用于"要不要替脚本开一笔自动提交事务"**，与准入判定无关。
+  受管契约本身由服务端判（单表 + 显式 BEGIN + 身份），这里只是把自动提交翻译成等价形状。
+*/
+static int raft_is_write_statement(const char *query, size_t len)
+{
+  char word[16];
+
+  raft_first_word(query, len, word, sizeof(word));
+
+  return strcmp(word, "insert") == 0 || strcmp(word, "update") == 0 ||
+         strcmp(word, "delete") == 0 || strcmp(word, "replace") == 0;
+}
+
+/*
+  自动提交包装（M1-1）。
+  背景（实测）：sysbench 的组合脚本自己发 BEGIN（`oltp_read_write.lua` 等），但
+  `oltp_insert.lua` / `oltp_delete.lua` / `oltp_update_*.lua` 的 event() **只有一条语句**，
+  靠自动提交——它们在受管集群上会被 8109 拒。给这类语句各包一笔受管事务，
+  语义与自动提交**完全一致**（一条语句一笔事务），因此不必改脚本、也不改变压测语义。
+
+  返回：
+    0 = 不需要包装（读语句 / 脚本自己开着事务 / 脚本自己发的是 BEGIN|COMMIT）
+    1 = 已开隐式事务，调用方必须在语句结束后调 raft_implicit_finish()
+   -1 = **BEGIN 本身被服务端拒了**，调用方必须把这条 BEGIN 的错误报给压测框架
+        （原因可能是 1402 / 3197 / 810x —— 实测在 follower 上是 1402 XA_RBROLLBACK）。
+        别把它吞成日志再让下一条语句去报错：那样客户端看到的错误类别是错的
+        （follower 上会变成 8107 "not leader"，而真正的原因是 BEGIN 的预检失败）。
+*/
+static int raft_implicit_begin_if_needed(db_mysql_conn_t *c, const char *query, size_t len)
+{
+  if (c == NULL || !c->managed_identity)
+    return 0;
+
+  if (raft_is_txn_start(query, len))
+  {
+    raft_set_request_id(c);          /* 身份必须在 BEGIN 之前设 */
+    c->txn_open = 1;
+    return 0;
+  }
+
+  if (raft_is_txn_end(query, len))
+  {
+    c->txn_open = 0;
+    return 0;
+  }
+
+  if (c->txn_open)                   /* 脚本自己开着事务：不插手 */
+    return 0;
+
+  if (!raft_is_write_statement(query, len))
+    return 0;                        /* 读语句不受管，也不需要事务 */
+
+  raft_set_request_id(c);
+
+  if (raft_run_sql(c->mysql, "BEGIN") != 0)
+  {
+    log_text(LOG_WARNING, "Percona Raft: implicit BEGIN failed: %s",
+             mysql_error(c->mysql));
+    return -1;                       /* 调用方用 check_error() 上报并分类 */
+  }
+
+  c->txn_open = 1;
+  raft_bump(&raft_implicit_txns);
+
+  return 1;
+}
+
+/* 收尾隐式事务：语句成功就 COMMIT，失败就 ROLLBACK（别把残局留给下一条语句） */
+static int raft_implicit_finish(db_mysql_conn_t *c, int statement_ok)
+{
+  int rc;
+
+  if (c == NULL)
+    return 0;
+
+  rc = raft_run_sql(c->mysql, statement_ok ? "COMMIT" : "ROLLBACK");
+  c->txn_open = 0;
+
+  return rc;                         /* != 0 时 mysql_error(c->mysql) 里有原因 */
+}
+
+/* 错误码分栏（按数值；口径见 §3.3 的错误码表） */
+static void raft_classify_error(unsigned int error)
+{
+  switch (error)
+  {
+    case 3098:   /* ER_BEFORE_DML_VALIDATION_ERROR：执行前校验 */
+    case 8109:   /* ER_PERCONA_RAFT_WRITE_UNSUPPORTED */
+    case 8111:   /* ER_PERCONA_RAFT_WRITE_SCHEMA_CUTOVER（DDL 排空窗口内的预期拒绝） */
+    case 8112:   /* ACL_STATEMENT_FAILED */
+    case 8113:   /* ACL_STATEMENT_REJECTED */
+    case 8114:   /* METADATA_STATEMENT_REJECTED */
+      raft_bump(&raft_cls_refused);
+      break;
+
+    case 3197:   /* ER_XA_RETRY：提交结果未知，可带同一 request identity 重试 */
+      raft_bump(&raft_cls_ambiguous);
+      break;
+
+    case 1402:   /* XA_RBROLLBACK：已决定的回滚 */
+      raft_bump(&raft_cls_rolled_back_xa);
+      break;
+
+    case 8100: case 8101: case 8103: case 8104:
+    case 8105: case 8107: case 8110:
+    case 8115:   /* 临时态：换主/多数派抖动/读屏障超时，退避重试可自愈 */
+      raft_bump(&raft_cls_temporary);
+      break;
+
+    case 8102:   /* NODE_ISOLATED：本节点被隔离，重试不会自愈 */
+    case 8106:   /* RECOVERY_REQUIRED */
+    case 8108:   /* WRITE_RECOVERY_REQUIRED */
+      raft_bump(&raft_cls_needs_action);   /* 需要人工介入，别混进"临时态" */
+      break;
+
+    default:
+      break;     /* 其它错误不进分类：仍由 sysbench 原有的 errors/FATAL 逻辑处理 */
+  }
+}
 
 /* Structure used for DB-to-MySQL bind types map */
 
@@ -455,6 +763,9 @@ int mysql_drv_connect(db_conn_t *sb_conn)
 
   sb_conn->ptr = db_mysql_con;
 
+  /* perf-tool fork：探测身份变量并设 namespace（每连接一次） */
+  raft_setup_identity(db_mysql_con);
+
   return 0;
 }
 
@@ -719,6 +1030,9 @@ static db_error_t check_error(db_conn_t *sb_con, const char *func,
 
   sb_con->sql_errno = (int) error;
 
+  /* perf-tool fork：错误码分栏（不改原有 ignored errors/FATAL 判定） */
+  raft_classify_error(error);
+
   sb_con->sql_state = mysql_sqlstate(con);
   DEBUG("mysql_state(%p) = %s", con, sb_con->sql_state);
 
@@ -802,11 +1116,27 @@ db_error_t mysql_drv_execute(db_stmt_t *stmt, db_result_t *rs)
       return DB_ERROR_FATAL;
     }
 
+    /* perf-tool fork：预处理语句路径同样要注入身份 / 换 request_id / 自动提交包装 */
+    db_mysql_conn_t *db_mysql_con = (db_mysql_conn_t *) con->ptr;
+    int implicit = raft_implicit_begin_if_needed(
+        db_mysql_con, stmt->query, stmt->query == NULL ? 0 : strlen(stmt->query));
+
+    if (SB_UNLIKELY(implicit < 0))
+      return check_error(con, "mysql_stmt_execute(BEGIN)", "BEGIN", &rs->counter);
+
     int err = mysql_stmt_execute(stmt->ptr);
     DEBUG("mysql_stmt_execute(%p) = %d", stmt->ptr, err);
 
     if (err)
+    {
+      if (implicit)
+        raft_implicit_finish(db_mysql_con, 0);
       return check_error(con, "mysql_stmt_execute()", stmt->query,
+                         &rs->counter);
+    }
+
+    if (implicit && raft_implicit_finish(db_mysql_con, 1) != 0)
+      return check_error(con, "mysql_stmt_execute(COMMIT)", "COMMIT",
                          &rs->counter);
 
     if (stmt->counter != SB_CNT_READ)
@@ -899,11 +1229,28 @@ db_error_t mysql_drv_query(db_conn_t *sb_conn, const char *query, size_t len,
   db_mysql_con = (db_mysql_conn_t *)sb_conn->ptr;
   con = db_mysql_con->mysql;
 
+  /* perf-tool fork：身份注入 + 显式 BEGIN 时换 request_id + 自动提交包装（见 §7.1） */
+  int implicit = raft_implicit_begin_if_needed(db_mysql_con, query, len);
+
+  if (SB_UNLIKELY(implicit < 0))
+    return check_error(sb_conn, "mysql_drv_query(BEGIN)", "BEGIN", &rs->counter);
+
   int err = mysql_real_query(con, query, len);
   DEBUG("mysql_real_query(%p, \"%s\", %zd) = %d", con, query, len, err);
 
   if (SB_UNLIKELY(err != 0))
+  {
+    if (implicit)
+      raft_implicit_finish(db_mysql_con, 0);
     return check_error(sb_conn, "mysql_drv_query()", query, &rs->counter);
+  }
+
+  /*
+    语句成了、COMMIT 没成 —— 这笔事务**没有**提交，客户端必须知道：
+    报 COMMIT 自己的错误（分类器会把 3197/81xx 记进对应栏）。
+  */
+  if (implicit && raft_implicit_finish(db_mysql_con, 1) != 0)
+    return check_error(sb_conn, "mysql_drv_query(COMMIT)", "COMMIT", &rs->counter);
 
   /* Store results and get query type */
   MYSQL_RES *res = mysql_store_result(con);
@@ -1040,6 +1387,34 @@ int mysql_drv_done(void)
 {
   if (args.dry_run)
     return 0;
+
+  /*
+    perf-tool fork：在标准报告之后追加一段（**不改原有统计口径**）。
+    为什么放这里：`db_done()` 在报告之后被调用，因此不必改 db_driver.{c,h} 的报告代码，
+    改动面收敛在驱动这一个文件里。
+  */
+  log_text(LOG_NOTICE, "");
+  log_text(LOG_NOTICE, "Percona Raft (perf-tool fork):");
+  log_text(LOG_NOTICE, "    request identity injection:        %s",
+           raft_identity_available
+             ? "on  (server has percona_raft_request_*)"
+             : "off (server has no percona_raft_request_*)");
+  log_text(LOG_NOTICE, "    connections with injected identity: %llu / %llu",
+           raft_conns_with_identity, raft_conns_total);
+  log_text(LOG_NOTICE, "    request ids issued:                %-6llu",
+           raft_request_ids_issued);
+  log_text(LOG_NOTICE, "    autocommit transactions wrapped:   %-6llu (脚本没发 BEGIN 时由驱动补)",
+           raft_implicit_txns);
+  log_text(LOG_NOTICE, "    error classes   refused:           %-6llu (3098/8109/8111/8112/8113/8114)",
+           raft_cls_refused);
+  log_text(LOG_NOTICE, "                    ambiguous:         %-6llu (3197 结果未知, 可带同一 identity 重试)",
+           raft_cls_ambiguous);
+  log_text(LOG_NOTICE, "                    temporary:         %-6llu (8100/8101/8103-8105/8107/8110/8115 可退避重试)",
+           raft_cls_temporary);
+  log_text(LOG_NOTICE, "                    needs_action:      %-6llu (8102/8106/8108 重试不自愈, 要人工介入)",
+           raft_cls_needs_action);
+  log_text(LOG_NOTICE, "                    rolled_back_xa:    %-6llu (1402 已决定的回滚)",
+           raft_cls_rolled_back_xa);
 
   mysql_library_end();
 
