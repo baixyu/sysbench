@@ -70,6 +70,10 @@ static void db_free_row(db_row_t *);
 #endif
 static int db_bulk_do_insert(db_conn_t *, int);
 static void db_reset_stats(void);
+
+/* perf-tool fork: 报告段要用的驱动句柄。db_report_cumulative() 拿不到连接，
+   而一次进程只用一个驱动（--db-driver），所以在 db_create() 里记住它。 */
+static db_driver_t *active_driver;
 static int db_free_results_int(db_conn_t *con);
 
 /* DB layer arguments */
@@ -87,6 +91,11 @@ static sb_arg_t db_args[] =
   SB_OPT("db-ps-mode", "prepared statements usage mode {auto, disable}", "auto",
          STRING),
   SB_OPT("db-debug", "print database-specific debug information", "off", BOOL),
+  /* perf-tool fork：不带上 --mysql- 前缀，因为这是"被测目标是什么"、不是驱动私有旋钮；
+     任何 Lua 脚本都能用（不需要脚本自己声明选项）。 */
+  SB_OPT("target", "target server class: {auto, raft, mysql} "
+         "(raft: require the managed-write contract; mysql: native, no injection)",
+         "auto", STRING),
 
   SB_OPT_END
 };
@@ -280,6 +289,8 @@ db_driver_t *db_create(const char *name)
     log_text(LOG_FATAL, "thread-local driver initialization failed.");
     return NULL;
   }
+
+  active_driver = drv;
 
   return drv;
 
@@ -750,6 +761,20 @@ int db_parse_arguments(void)
   db_globals.driver = sb_get_value_string("db-driver");
 
   db_globals.debug = sb_get_value_flag("db-debug");
+
+  s = sb_get_value_string("target");
+
+  if (!strcmp(s, "auto"))
+    db_globals.target = DB_TARGET_AUTO;
+  else if (!strcmp(s, "raft"))
+    db_globals.target = DB_TARGET_RAFT;
+  else if (!strcmp(s, "mysql"))
+    db_globals.target = DB_TARGET_MYSQL;
+  else
+  {
+    log_text(LOG_FATAL, "Invalid value for target: %s (expected auto|raft|mysql)", s);
+    return 1;
+  }
   
   return 0;
 }
@@ -1048,6 +1073,11 @@ void db_report_cumulative(sb_stat_t *stat)
            " (%.2f per sec.)", stat->errors, stat->errors / seconds);
   log_text(LOG_NOTICE, "    reconnects:                          %-6" PRIu64
            " (%.2f per sec.)", stat->reconnects, stat->reconnects / seconds);
+
+  /* perf-tool fork：驱动的附加统计行，进的是**这一段**（原生 SQL statistics），
+     不是另起一段——所以"两侧同口径"的前提（原有列一个不动）是结构上成立的。 */
+  if (active_driver != NULL && active_driver->ops.report_stats != NULL)
+    active_driver->ops.report_stats();
 
   if (db_globals.debug)
   {

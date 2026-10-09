@@ -36,6 +36,17 @@ typedef enum
   DB_PS_MODE_DISABLE,
 } db_ps_mode_t;
 
+/* perf-tool fork: 目标档（--target）
+   auto  = 按能力探测（默认；探测到 percona_raft_request_* 才注入身份）
+   raft  = 断言受管集群：探测不到身份变量就**立刻失败**（别把"跑错了目标"读成性能结论）
+   mysql = 原生 MySQL：不探测、不注入，纯 stock 行为 */
+typedef enum
+{
+  DB_TARGET_AUTO,
+  DB_TARGET_RAFT,
+  DB_TARGET_MYSQL,
+} db_target_t;
+
 /* Global DB API options */
 
 typedef struct
@@ -43,6 +54,7 @@ typedef struct
   db_ps_mode_t  ps_mode;   /* Requested prepared statements usage mode */
   char          *driver;   /* Requested database driver */
   unsigned char debug;     /* debug flag */
+  db_target_t   target;    /* perf-tool fork: --target 档位 */
 } db_globals_t;
 
 /* Driver capabilities definition */
@@ -139,6 +151,9 @@ typedef int drv_op_free_results(struct db_result *);
 typedef int drv_op_close(struct db_stmt *);
 typedef int drv_op_thread_done(int);
 typedef int drv_op_done(void);
+/* perf-tool fork: 可选的附加统计行。为 NULL 的驱动不受影响（pgsql 就是 NULL）。
+   调用点：db_report_cumulative() 的原生 "SQL statistics:" 段内（不是另开一段表）。 */
+typedef int drv_op_report_stats(void);
 
 typedef struct
 {
@@ -159,6 +174,7 @@ typedef struct
   drv_op_query           *query;          /* execute non-prepared statement */
   drv_op_thread_done     *thread_done;    /* thread-local driver deinitialization */
   drv_op_done            *done;           /* uninitialize driver */
+  drv_op_report_stats    *report_stats;   /* perf-tool fork: extra rows in the native report */
 } drv_ops_t;
 
 /* Database driver definition */

@@ -113,6 +113,7 @@ typedef struct
   */
   unsigned char      managed_identity;   /* 身份变量存在且 namespace 已设 */
   unsigned char      txn_open;           /* 本连接当前有一笔事务开着（显式或隐式） */
+  unsigned char      target_mismatch;    /* --target=raft 但服务端没有身份变量 */
   unsigned long long txn_seq;            /* 本连接已开始的受管事务数 */
 } db_mysql_conn_t;
 
@@ -190,6 +191,21 @@ static void raft_setup_identity(db_mysql_conn_t *db_mysql_con)
     return;
 
   /*
+    --target 分档（§4.0）：
+      raft  = 断言这是受管集群：探测不到身份变量就**立刻失败**——否则"跑错了目标"
+              会被读成性能结论（对原生 MySQL 跑 raft 档，写语句根本不受管，
+              报告里 unmanaged 增量是 0，但那个 0 毫无意义）。
+      mysql = 原生 MySQL：连探测都不做（省一次往返），纯 stock 行为。
+      auto  = 按能力探测（默认）。
+  */
+  if (db_globals.target == DB_TARGET_MYSQL)
+  {
+    log_text(LOG_DEBUG, "Percona Raft: --target=mysql, no capability probe, "
+                        "no identity injection");
+    return;
+  }
+
+  /*
     为什么每个连接各探一次、而不是"进程内只探一次"：
     先前用 `raft_identity_probed` 做闩锁，但它是"先发布闩锁、后写探测结果"——
     第二个线程会看到 probed==1 而 available 仍是 0，于是**整条连接不设 namespace**，
@@ -201,6 +217,17 @@ static void raft_setup_identity(db_mysql_conn_t *db_mysql_con)
 
   if (!raft_probe_identity(con))
   {
+    if (db_globals.target == DB_TARGET_RAFT)
+    {
+      log_text(LOG_FATAL,
+               "Percona Raft: --target=raft but this server has no "
+               "percona_raft_request_namespace/percona_raft_request_id.  "
+               "Either the target is not our build (use --target=mysql), or this "
+               "is not the mode under test (use --target=auto).");
+      db_mysql_con->target_mismatch = 1;
+      return;
+    }
+
     log_text(LOG_DEBUG, "Percona Raft: no percona_raft_request_* on this server; "
                         "no identity injected (native target)");
     return;
@@ -483,6 +510,7 @@ static int mysql_drv_free_results(db_result_t *);
 static int mysql_drv_close(db_stmt_t *);
 static int mysql_drv_thread_done(int);
 static int mysql_drv_done(void);
+static int mysql_drv_report_stats(void);
 
 /* MySQL driver definition */
 
@@ -508,7 +536,8 @@ static db_driver_t mysql_driver =
     .close = mysql_drv_close,
     .query = mysql_drv_query,
     .thread_done = mysql_drv_thread_done,
-    .done = mysql_drv_done
+    .done = mysql_drv_done,
+    .report_stats = mysql_drv_report_stats
   }
 };
 
@@ -765,6 +794,23 @@ int mysql_drv_connect(db_conn_t *sb_conn)
 
   /* perf-tool fork：探测身份变量并设 namespace（每连接一次） */
   raft_setup_identity(db_mysql_con);
+
+  /*
+    --target=raft 的"立刻失败"：连上了、但没有受管写契约。
+    必须**返回失败**而不是记条日志继续跑——继续跑会得到一份"unmanaged 增量 0"的漂亮报告，
+    而那个 0 只说明"这台根本没有那道门"（§4.0/§7.1），会被读成性能结论。
+  */
+  if (db_mysql_con->target_mismatch)
+  {
+    log_text(LOG_FATAL, "aborting: --target=raft requires the managed-write "
+                        "contract on host '%s', port %u",
+             db_mysql_con->host, db_mysql_con->port);
+    mysql_close(db_mysql_con->mysql);
+    free(db_mysql_con->mysql);
+    free(db_mysql_con);
+    sb_conn->ptr = NULL;
+    return 1;
+  }
 
   return 0;
 }
@@ -1383,38 +1429,47 @@ int mysql_drv_close(db_stmt_t *stmt)
 
 
 /* Uninitialize driver */
+/*
+  perf-tool fork：附加统计行。**由 db_driver.c 调进原生 "SQL statistics:" 段里**
+  （`drv_ops_t.report_stats`；调用点在 `db_report_cumulative()` 的 `reconnects:` 之后），
+  所以不是另起一段表——原统计列一个不动，新增的行只是接在它们后面。
+  这里只打"契约成立与否 + 错误语义分栏"，不打吞吐/延迟（那是原生那几行的事）。
+*/
+int mysql_drv_report_stats(void)
+{
+  static const char *target_name[] = {"auto", "raft", "mysql"};
+
+  log_text(LOG_NOTICE, "    target:                              %s",
+           target_name[db_globals.target]);
+  log_text(LOG_NOTICE, "    request identity injection:          %s",
+           raft_identity_available
+             ? "on  (server has percona_raft_request_*)"
+             : "off (server has no percona_raft_request_*)");
+  log_text(LOG_NOTICE, "    connections with injected identity:  %llu / %llu",
+           raft_conns_with_identity, raft_conns_total);
+  log_text(LOG_NOTICE, "    request ids issued:                  %-6llu",
+           raft_request_ids_issued);
+  log_text(LOG_NOTICE, "    autocommit txns wrapped by driver:   %-6llu",
+           raft_implicit_txns);
+  log_text(LOG_NOTICE, "    managed error classes:");
+  log_text(LOG_NOTICE, "        refused:                         %-6llu (3098/8109/8111/8112/8113/8114)",
+           raft_cls_refused);
+  log_text(LOG_NOTICE, "        ambiguous:                       %-6llu (3197 结果未知, 可带同一 identity 重试)",
+           raft_cls_ambiguous);
+  log_text(LOG_NOTICE, "        temporary:                       %-6llu (8100/8101/8103-8105/8107/8110/8115 可退避重试)",
+           raft_cls_temporary);
+  log_text(LOG_NOTICE, "        needs_action:                    %-6llu (8102/8106/8108 重试不自愈, 要人工介入)",
+           raft_cls_needs_action);
+  log_text(LOG_NOTICE, "        rolled_back_xa:                  %-6llu (1402 已决定的回滚)",
+           raft_cls_rolled_back_xa);
+
+  return DB_ERROR_NONE;
+}
+
 int mysql_drv_done(void)
 {
   if (args.dry_run)
     return 0;
-
-  /*
-    perf-tool fork：在标准报告之后追加一段（**不改原有统计口径**）。
-    为什么放这里：`db_done()` 在报告之后被调用，因此不必改 db_driver.{c,h} 的报告代码，
-    改动面收敛在驱动这一个文件里。
-  */
-  log_text(LOG_NOTICE, "");
-  log_text(LOG_NOTICE, "Percona Raft (perf-tool fork):");
-  log_text(LOG_NOTICE, "    request identity injection:        %s",
-           raft_identity_available
-             ? "on  (server has percona_raft_request_*)"
-             : "off (server has no percona_raft_request_*)");
-  log_text(LOG_NOTICE, "    connections with injected identity: %llu / %llu",
-           raft_conns_with_identity, raft_conns_total);
-  log_text(LOG_NOTICE, "    request ids issued:                %-6llu",
-           raft_request_ids_issued);
-  log_text(LOG_NOTICE, "    autocommit transactions wrapped:   %-6llu (脚本没发 BEGIN 时由驱动补)",
-           raft_implicit_txns);
-  log_text(LOG_NOTICE, "    error classes   refused:           %-6llu (3098/8109/8111/8112/8113/8114)",
-           raft_cls_refused);
-  log_text(LOG_NOTICE, "                    ambiguous:         %-6llu (3197 结果未知, 可带同一 identity 重试)",
-           raft_cls_ambiguous);
-  log_text(LOG_NOTICE, "                    temporary:         %-6llu (8100/8101/8103-8105/8107/8110/8115 可退避重试)",
-           raft_cls_temporary);
-  log_text(LOG_NOTICE, "                    needs_action:      %-6llu (8102/8106/8108 重试不自愈, 要人工介入)",
-           raft_cls_needs_action);
-  log_text(LOG_NOTICE, "                    rolled_back_xa:    %-6llu (1402 已决定的回滚)",
-           raft_cls_rolled_back_xa);
 
   mysql_library_end();
 
