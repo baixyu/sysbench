@@ -103,9 +103,13 @@ local function variable_map(con, like)
 end
 
 --
--- 三张哨兵表（§8.4）：全类型 / 索引形状 / 行长
--- 注意：**不能带列级 DEFAULT**（实测被具名拒：UNSUPPORTED_CLAUSE），
--- 也不含地理类型、分区、临时表、触发器、外键。
+-- 四张哨兵表（§8.4）：全类型（两份）/ 索引形状 / 行长
+-- 不含地理类型、分区、临时表、触发器、外键。
+-- 订正（2026-10-09，v6）：先前这里写着"不能带列级 DEFAULT（实测被具名拒 UNSUPPORTED_CLAUSE）"，
+-- **那是 v5 的事实**；manifest v6 已把列级 DEFAULT 绑进证明机制（`fcdd7563aaa`），
+-- 分类器也不再按名拒（`ef2f735da32`）。实测：带 DEFAULT '0' 的 stock 形状 CREATE TABLE
+-- 经 SCHEMA_TRANSITION 是 APPLIED 且三台 DEFAULT 保留。所以这条限制不再存在——
+-- 但哨兵表的 DDL 保持不变：它们的作用是**冻结字节**，改 DDL 就该重新冻结一次（别偷偷改）。
 --
 
 local GOLDEN = {
@@ -158,6 +162,48 @@ local GOLDEN = {
   KEY k_func ((k + 1)),
   KEY k_multi ((CAST(j->>'$.a' AS UNSIGNED ARRAY))),
   KEY k_invisible (v) INVISIBLE
+) ENGINE=InnoDB]],
+   },
+   {
+      -- 与上面 27 列的 alltypes 并存：那份是 M0 起就冻结的老哨兵（形状稳定、字节可比），
+      -- 这一份是**现场 correctness harness 用的 31 列矩阵**（照 `app.alltypes` 的
+      -- SHOW CREATE TABLE 抄下来，§4.1.1）。两份一起验：
+      -- 前者盯"编码/metadata 有没有变"，后者盯"我们声明的类型面服务端是否全收"。
+      name = "alltypes31",
+      note = "现场 31 列全类型矩阵（照 app.alltypes 的真实定义，§4.1.1）",
+      ddl = [[CREATE TABLE %SCHEMA%.alltypes31 (
+  c_long INT NOT NULL,
+  c_tiny TINYINT,
+  c_utiny TINYINT UNSIGNED,
+  c_short SMALLINT,
+  c_int24 MEDIUMINT,
+  c_ulong INT UNSIGNED,
+  c_longlong BIGINT,
+  c_float FLOAT,
+  c_double DOUBLE,
+  c_dec DECIMAL(18,6),
+  c_date DATE,
+  c_year YEAR,
+  c_ts TIMESTAMP(6) NULL,
+  c_dt DATETIME(3),
+  c_time TIME(2),
+  c_char CHAR(40),
+  c_binary BINARY(20),
+  c_varchar VARCHAR(300),
+  c_varbinary VARBINARY(100),
+  c_tinytext TINYTEXT,
+  c_text TEXT,
+  c_mediumtext MEDIUMTEXT,
+  c_longtext LONGTEXT,
+  c_tinyblob TINYBLOB,
+  c_blob BLOB,
+  c_mediumblob MEDIUMBLOB,
+  c_longblob LONGBLOB,
+  c_json JSON,
+  c_bit BIT(13),
+  c_enum ENUM('a','b','c'),
+  c_set SET('x','y','z'),
+  PRIMARY KEY (c_long)
 ) ENGINE=InnoDB]],
    },
    {

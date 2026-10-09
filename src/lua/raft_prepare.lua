@@ -104,23 +104,58 @@ local FIXED_BYTES = {
    k = 4,      -- INT
 }
 
--- 必需列（业务列）+ 填充列。返回：列定义串数组、定宽总字节、填充列、索引串、目标内容长度
---
--- 宽度怎么定（§5）：判据是 **AVG(列数据字节数)**，而定宽列按声明宽度算、变长列按 LENGTH() 算，
--- 所以"填充列的内容长度"要正好等于 B - 定宽字节数，才能让 AVG **恰好**命中 B。
--- VARCHAR 的容量必须**大于**内容长度：一是要留出分布（§5 要求 min/p50/p99/max），
--- 二是 VARCHAR 的长度前缀（1 或 2 字节）不进 LENGTH()，挤占容量就会让内容被迫截短、AVG 偏低。
--- 先前把容量算成"剩余 - 前缀"⇒ 目标内容长度被容量卡住、分布塌成单值、AVG 差 2 字节，已修。
-local function table_shape(b, profile)
+-- 定宽列的字节宽度（MySQL 存储宽度；只用于"必需列/数值列"这一部分，
+-- 不用于字符/二进制/TEXT/JSON 等——那些一律按 LENGTH() 实测，见 row_bytes_expr）
+local FIXED_BYTES = {
+   id = 4, k = 4,                                     -- builtin profile
+   -- app.alltypes 的 31 列里的定宽部分（照现场那张表的真实定义，见 schemas/golden/alltypes.sql）
+   c_long = 4, c_tiny = 1, c_utiny = 1, c_short = 2, c_int24 = 3,
+   c_ulong = 4, c_longlong = 8,
+   c_float = 4, c_double = 8, c_dec = 9,              -- DECIMAL(18,6) 的 InnoDB 存储宽度
+   c_date = 3, c_year = 1, c_ts = 7, c_dt = 7, c_time = 4,
+}
+
+-- ---------------------------------------------------------------------------
+-- profile：一张表的"形状" = 列定义 + 定宽字节 + 填充列 + 索引 + 逐行取值函数
+-- ---------------------------------------------------------------------------
+
+-- 定长 ASCII 内容（1 字符 = 1 字节）：字符/文本列用它，好让"列数据字节数"可预测
+local function ascii_of(rng, len, tag)
+   local head = tag .. ":"
+   if len <= #head then return head:sub(1, len) end
+   local out = {head}
+   local remain = len - #head
+   while remain > 0 do
+      local n = math.min(remain, 16)
+      local buf = {}
+      for i = 1, n do
+         local r = rng()
+         buf[i] = ALPHABET:sub((r % #ALPHABET) + 1, (r % #ALPHABET) + 1)
+      end
+      out[#out + 1] = table.concat(buf)
+      remain = remain - n
+   end
+   return table.concat(out)
+end
+
+local function hex_of(rng, len, tag)   -- 二进制列：2×len 个十六进制字符
+   local a = ascii_of(rng, len, tag)
+   return (a:gsub(".", function(c)
+      return string.format("%02x", string.byte(c))
+   end))
+end
+
+-- builtin profile：少量常见列，填充列 c 承载目标行长
+local function builtin_shape(b, profile)
    local cols, fixed = {}, 0
    local fill = {}
-   local target = 0
 
    cols[#cols + 1] = "id INT NOT NULL"
    fixed = fixed + FIXED_BYTES.id
    cols[#cols + 1] = "k INT NOT NULL"
    fixed = fixed + FIXED_BYTES.k
 
+   local target = 0
    if b > 0 then
       target = b - fixed
       if target < 2 then
@@ -128,7 +163,6 @@ local function table_shape(b, profile)
              "填充列至少还要 2 字节内容才能形成分布。最小可行 B = %d",
              b, fixed, fixed + 2)
       end
-      -- 容量 = 内容目标 + 余量（余量给分布用；0.3t 是 §5 那个 ±30% 分布的宽度）
       local headroom = math.max(16, math.floor(target * 0.3))
       local n = target + headroom
       cols[#cols + 1] = string.format("c VARCHAR(%d) NOT NULL", n)
@@ -136,27 +170,151 @@ local function table_shape(b, profile)
                          target = target}
    end
 
-   local idx = "PRIMARY KEY (id)"
-   if profile == "pk_secondary" then
-      idx = idx .. ", KEY k_k (k)"
-   elseif profile ~= "pk" then
-      die("--index-profile 只支持 pk | pk_secondary（收到 '%s'）", profile)
-   end
-
-   return cols, fixed, fill, idx, target
+   return {
+      cols = cols, fixed = fixed, fill = fill, target = target,
+      idx = (profile == "pk_secondary") and "PRIMARY KEY (id), KEY k_k (k)"
+                                      or "PRIMARY KEY (id)",
+      values = function(id, rng, lens, i)
+         local v = {tostring(id), tostring((id * 7) % 100000)}
+         if fill[1] ~= nil then
+            v[#v + 1] = "'" .. ascii_of(rng, lens[((i - 1) % #lens) + 1], "r" .. id) .. "'"
+         end
+         return v
+      end,
+   }
 end
 
--- 列类型档：目前只有 builtin 落地。**不做静默降级**——all（§4.1.1 全类型表）是 M2 的范围
--- （方案 §10 的 M2 行：多表 + 全类型矩阵 21 种 / 31 列 + 行长分布）。
-local function check_types()
-   local t = sysbench.opt.types
-   if t == "builtin" then return end
-   if t == "all" then
-      die("--types=all（§4.1.1 全类型表，31 列）尚未落地，属 M2 范围；" ..
-          "现在只支持 --types=builtin。**不静默降级成 builtin**：" ..
-          "用错了档却拿到一张小表，会让之后的对比全都不可比。")
+-- all-types profile：照现场那张 app.alltypes（**31 列**，`SHOW CREATE TABLE` 抄下来的真实定义），
+-- 覆盖除地理空间外的全部列类型。`--row-length` 由 `c_varchar` 承载（把它加宽到装得下目标），
+-- **列数与类型面都不变**——只是同一个 VARCHAR 列更长。
+local ALLTYPES = {
+   {name = "c_long",     ddl = "INT NOT NULL",              gen = function(id) return tostring(id) end},
+   {name = "c_tiny",     ddl = "TINYINT",                   gen = function(id) return tostring(id % 100) end},
+   {name = "c_utiny",    ddl = "TINYINT UNSIGNED",          gen = function(id) return tostring(id % 200) end},
+   {name = "c_short",    ddl = "SMALLINT",                  gen = function(id) return tostring(id % 30000) end},
+   {name = "c_int24",    ddl = "MEDIUMINT",                 gen = function(id) return tostring(id % 8000000) end},
+   {name = "c_ulong",    ddl = "INT UNSIGNED",              gen = function(id) return tostring(id * 3) end},
+   {name = "c_longlong", ddl = "BIGINT",                    gen = function(id) return tostring(id * 1000003) end},
+   {name = "c_float",    ddl = "FLOAT",                     gen = function(id) return string.format("%d.5", id % 1000) end},
+   {name = "c_double",   ddl = "DOUBLE",                    gen = function(id) return string.format("%d.25", id % 100000) end},
+   {name = "c_dec",      ddl = "DECIMAL(18,6)",             gen = function(id) return string.format("%d.250000", id % 1000000) end},
+   {name = "c_date",     ddl = "DATE",                      gen = function() return "'2024-01-02'" end},
+   {name = "c_year",     ddl = "YEAR",                      gen = function() return "2024" end},
+   {name = "c_ts",       ddl = "TIMESTAMP(6) NULL",         gen = function() return "'2024-01-02 03:04:05.123456'" end},
+   {name = "c_dt",       ddl = "DATETIME(3)",               gen = function() return "'2024-01-02 03:04:05.678'" end},
+   {name = "c_time",     ddl = "TIME(2)",                   gen = function() return "'12:34:56.78'" end},
+   {name = "c_char",     ddl = "CHAR(10)",       var = 10,  gen = function(id, rng) return "'" .. ascii_of(rng, 10, "ch") .. "'" end},
+   {name = "c_binary",   ddl = "BINARY(8)",      var = 8,   gen = function(id, rng) return "x'" .. hex_of(rng, 8, "bi") .. "'" end},
+   -- 填充列：内容长度由 fill_lengths 决定（值函数放在 shape 里覆盖）
+   {name = "c_varchar",  ddl = "VARCHAR(%d)",    var = 0,   gen = nil},
+   {name = "c_varbinary",ddl = "VARBINARY(100)", var = 20,  gen = function(id, rng) return "x'" .. hex_of(rng, 20, "vb") .. "'" end},
+   {name = "c_tinytext", ddl = "TINYTEXT",       var = 12,  gen = function(id, rng) return "'" .. ascii_of(rng, 12, "tt") .. "'" end},
+   {name = "c_text",     ddl = "TEXT",           var = 24,  gen = function(id, rng) return "'" .. ascii_of(rng, 24, "tx") .. "'" end},
+   {name = "c_mediumtext", ddl = "MEDIUMTEXT",   var = 32,  gen = function(id, rng) return "'" .. ascii_of(rng, 32, "mt") .. "'" end},
+   {name = "c_longtext", ddl = "LONGTEXT",       var = 40,  gen = function(id, rng) return "'" .. ascii_of(rng, 40, "lt") .. "'" end},
+   {name = "c_tinyblob", ddl = "TINYBLOB",       var = 8,   gen = function(id, rng) return "x'" .. hex_of(rng, 8, "tb") .. "'" end},
+   {name = "c_blob",     ddl = "BLOB",           var = 16,  gen = function(id, rng) return "x'" .. hex_of(rng, 16, "bl") .. "'" end},
+   {name = "c_mediumblob", ddl = "MEDIUMBLOB",   var = 24,  gen = function(id, rng) return "x'" .. hex_of(rng, 24, "mb") .. "'" end},
+   {name = "c_longblob", ddl = "LONGBLOB",       var = 32,  gen = function(id, rng) return "x'" .. hex_of(rng, 32, "lb") .. "'" end},
+   -- 下面四列也走 LENGTH() 实测，所以内容长度要**确定**，否则期望值会白偏几个字节：
+   -- JSON 用定宽字符串值（JSON 数字不许有前导零，所以放进字符串里）⇒ 恒 13 字符；
+   -- BIT(13) 存储 2 字节；ENUM/SET 各 1 字符。
+   {name = "c_json",     ddl = "JSON",           var = 13,  gen = function(id) return string.format("'{\"i\":\"%05d\"}'", id) end},
+   {name = "c_bit",      ddl = "BIT(13)",        var = 2,   gen = function(id) return "b'1010101010101'" end},
+   {name = "c_enum",     ddl = "ENUM('a','b','c')", var = 1, gen = function(id) return "'" .. ({"a","b","c"})[(id % 3) + 1] .. "'" end},
+   {name = "c_set",      ddl = "SET('x','y','z')", var = 1,  gen = function(id) return "'" .. ({"x","y","z"})[(id % 3) + 1] .. "'" end},
+}
+
+local function alltypes_shape(b, profile)
+   -- 定宽部分：ALLTYPES 里没有 var 字段的都是定宽（数值/时间）
+   local fixed = 0
+   local var_known = 0
+   for _, c in ipairs(ALLTYPES) do
+      if c.var == nil then
+         local w = FIXED_BYTES[c.name]
+         if w == nil then
+            die("内部错误：列 %s 没有声明宽度（alltypes 的定宽表漏了）", c.name)
+         end
+         fixed = fixed + w
+      elseif c.name ~= "c_varchar" then
+         var_known = var_known + c.var
+      end
    end
-   die("--types 只支持 builtin | all（收到 '%s'）", t)
+
+   local target = 0
+   local n = 0
+   if b > 0 then
+      target = b - fixed - var_known
+      if target < 2 then
+         die("目标行长 B=%d 太小：alltypes 的定宽列（%d 字节）+ 其它变长列" ..
+             "（%d 字节）已经占满。最小可行 B ≈ %d",
+             b, fixed, var_known, fixed + var_known + 2)
+      end
+      local headroom = math.max(16, math.floor(target * 0.3))
+      n = target + headroom
+   end
+
+   -- 其它变长列（不含 c_varchar）也进实测表达式：内容长度固定 ⇒ 可预测
+   -- 实测表达式里的变长列：**排除填充列**（它由 fill 单独列出），否则会被算两次
+   local var_cols = {}
+   for _, c in ipairs(ALLTYPES) do
+      if c.var ~= nil and c.name ~= "c_varchar" then
+         var_cols[#var_cols + 1] = c.name
+      end
+   end
+
+   local cols = {}
+   for _, c in ipairs(ALLTYPES) do
+      if c.name == "c_varchar" then
+         cols[#cols + 1] = string.format("c_varchar VARCHAR(%d)", math.max(n, 1))
+      else
+         cols[#cols + 1] = c.name .. " " .. c.ddl
+      end
+   end
+
+   local fill = {}
+   if b > 0 then
+      fill[1] = {name = "c_varchar", capacity = n, prefix = (n < 256) and 1 or 2,
+                 target = target}
+   end
+
+   local names = {}
+   for _, c in ipairs(ALLTYPES) do
+      names[#names + 1] = c.name
+   end
+
+   return {
+      cols = cols, fixed = fixed, fill = fill, target = target,
+      var_cols = var_cols, var_bytes = var_known,
+      alltypes_cols = table.concat(names, ","),
+      idx = (profile == "pk_secondary") and "PRIMARY KEY (c_long), KEY c_tiny_k (c_tiny)"
+                                      or "PRIMARY KEY (c_long)",
+      values = function(id, rng, lens, i)
+         local v = {}
+         local len = (b > 0) and lens[((i - 1) % #lens) + 1] or 0
+         for _, c in ipairs(ALLTYPES) do
+            if c.name == "c_varchar" then
+               v[#v + 1] = "'" .. ascii_of(rng, len, "vr") .. "'"
+            else
+               v[#v + 1] = c.gen(id, rng)
+            end
+         end
+         return v
+      end,
+   }
+end
+
+local function make_shape(b, profile, types)
+   if profile ~= "pk" and profile ~= "pk_secondary" then
+      die("--index-profile 只支持 pk | pk_secondary（收到 '%s'）", profile)
+   end
+   if types == "builtin" then
+      return builtin_shape(b, profile)
+   end
+   if types == "all" then
+      return alltypes_shape(b, profile)
+   end
+   die("--types 只支持 builtin | all（收到 '%s'）", types)
 end
 
 local function table_ddl(db, name, cols, idx)
@@ -211,32 +369,33 @@ local function effective_batch(row_bytes)
    return b
 end
 
-local function load_table(con, db, name, fixed, fill, row_bytes)
+local function load_table(con, db, name, shape, row_bytes)
    local rng = make_rng(sysbench.opt.seed)
    local total = sysbench.opt.table_size
    local batch = effective_batch(row_bytes)
    local inserted = 0
 
    -- 填充长度序列与目标
-   local lens, target = fill_lengths((fill[1] ~= nil) and fill[1].target or 0,
-                                     (fill[1] ~= nil) and fill[1].capacity or 0)
+   local lens, target = fill_lengths((shape.fill[1] ~= nil) and shape.fill[1].target or 0,
+                                     (shape.fill[1] ~= nil) and shape.fill[1].capacity or 0)
+
+   local col_names = {}
+   if shape.alltypes_cols ~= nil then
+      col_names = shape.alltypes_cols
+   else
+      col_names = (shape.fill[1] ~= nil) and "id,k,c" or "id,k"
+   end
 
    while inserted < total do
       local rows = {}
       local n = math.min(batch, total - inserted)
       for i = 1, n do
          local id = inserted + i
-         local vals = {tostring(id), tostring((id * 7) % 100000)}
-         if fill[1] ~= nil then
-            local len = lens[((id - 1) % #lens) + 1]
-            vals[#vals + 1] = "'" .. fill_string(rng, len, "r" .. id) .. "'"
-         end
+         local vals = shape.values(id, rng, lens, i)
          rows[i] = "(" .. table.concat(vals, ",") .. ")"
       end
       local sql = string.format("INSERT INTO %s.%s (%s) VALUES %s",
-                                db, name,
-                                (fill[1] ~= nil) and "id,k,c" or "id,k",
-                                table.concat(rows, ","))
+                                db, name, col_names, table.concat(rows, ","))
       con:query(sql)
       inserted = inserted + n
    end
@@ -248,9 +407,13 @@ end
 -- 行长回读（§5：prepare 结束自动跑；不通过即失败）
 --
 
-local function row_bytes_expr(fixed, fill)
-   local parts = {tostring(fixed)}
-   for _, f in ipairs(fill) do
+local function row_bytes_expr(shape)
+   local parts = {tostring(shape.fixed)}
+   -- 变长列一律按 LENGTH() 实测（内容长度由生成器固定/或由填充列承载）
+   for _, name in ipairs(shape.var_cols or {}) do
+      parts[#parts + 1] = string.format("LENGTH(%s)", name)
+   end
+   for _, f in ipairs(shape.fill or {}) do
       parts[#parts + 1] = string.format("LENGTH(%s)", f.name)
    end
    return table.concat(parts, " + ")
@@ -265,13 +428,15 @@ local function percentile(con, db, name, expr, p, total)
    return tonumber(v) or 0
 end
 
-local function check_rowlen(con, db, names, fixed, fill, b)
-   local expr = row_bytes_expr(fixed, fill)
+local function check_rowlen(con, db, names, shape, b)
+   local expr = row_bytes_expr(shape)
+   local fixed, fill = shape.fixed, shape.fill or {}
    local tolerance = sysbench.opt.rowlen_tolerance
    local failures = 0
 
    print(string.format("raft_prepare.row_bytes_expr=%s", expr))
-   print(string.format("raft_prepare.row_bytes_fixed=%d", fixed))
+   print(string.format("raft_prepare.row_bytes_fixed=%d columns=%d types=%s",
+                       fixed, #shape.cols, sysbench.opt.types))
 
    for _, name in ipairs(names) do
       local total = tonumber(con:query_row(string.format(
@@ -337,59 +502,133 @@ local function cmd_ddl()
    local db = sql_ident(sysbench.opt.schema_db)
    if db == "" then die("必须给 --schema-db") end
    local b = sysbench.opt.row_length
-   check_types()
-   local cols, fixed, fill, idx, target = table_shape(b, sysbench.opt.index_profile)
+   local shape = make_shape(b, sysbench.opt.index_profile, sysbench.opt.types)
    for _, name in ipairs(table_names()) do
-      print(string.format("raft_prepare.ddl=%s", table_ddl(db, name, cols, idx)))
+      print(string.format("raft_prepare.ddl=%s", table_ddl(db, name, shape.cols, shape.idx)))
    end
-   print(string.format("raft_prepare.row_bytes_fixed=%d", fixed))
+   print(string.format("raft_prepare.types=%s columns=%d row_bytes_fixed=%d",
+                       sysbench.opt.types, #shape.cols, shape.fixed))
    if b > 0 then
-      local lens, t = fill_lengths(target, fill[1].capacity)
-      print(string.format("raft_prepare.fill_capacity=%d fill_target=%d fill_multiset=%s",
-                          fill[1].capacity, t, table.concat(lens, ",")))
-      print(string.format("raft_prepare.avg_row_bytes_expected=%d", fixed + t))
+      local f = shape.fill[1]
+      local lens, t = fill_lengths(f.target, f.capacity)
+      print(string.format("raft_prepare.fill_column=%s fill_capacity=%d fill_target=%d fill_multiset=%s",
+                          f.name, f.capacity, t, table.concat(lens, ",")))
+      -- 这只是**估算**（各类列的声明/内容长度之和）；§5 的主判据是 prepare/rowlen 的**回读实测**，
+      -- 两者差几个字节是正常的（例如列的实际内容长度与声明略有出入）。
+      print(string.format(
+         "raft_prepare.avg_row_bytes_estimate=%d (定宽 %d + 其它变长列 %d + 填充列内容均值 %d; 主判据是回读实测)",
+         shape.fixed + (shape.var_bytes or 0) + (t or 0),
+         shape.fixed, shape.var_bytes or 0, t or 0))
    end
 end
 
 local function cmd_prepare()
    local db = sql_ident(sysbench.opt.schema_db)
    if db == "" then die("必须给 --schema-db") end
-   check_types()
    local b = sysbench.opt.row_length
    local names = table_names()
-   local cols, fixed, fill, idx = table_shape(b, sysbench.opt.index_profile)
-   local row_bytes = fixed + ((fill[1] ~= nil) and fill[1].capacity or 0)
+   local shape = make_shape(b, sysbench.opt.index_profile, sysbench.opt.types)
+   local row_bytes = shape.fixed + ((shape.fill[1] ~= nil) and shape.fill[1].capacity or 0)
+                  + (#shape.cols * 8)
 
    local con = connect()
 
    if not sysbench.opt.quiet_ddl then
       for _, name in ipairs(names) do
-         print(string.format("raft_prepare.ddl=%s", table_ddl(db, name, cols, idx)))
+         print(string.format("raft_prepare.ddl=%s", table_ddl(db, name, shape.cols, shape.idx)))
       end
    end
 
    if not sysbench.opt.skip_ddl then
       for _, name in ipairs(names) do
-         con:query(table_ddl(db, name, cols, idx))
+         con:query(table_ddl(db, name, shape.cols, shape.idx))
          print(string.format("raft_prepare.created=%s", name))
       end
    end
 
    for _, name in ipairs(names) do
-      local inserted = load_table(con, db, name, fixed, fill, row_bytes)
+      local inserted = load_table(con, db, name, shape, row_bytes)
       print(string.format("raft_prepare.loaded=%s rows=%d", name, inserted))
    end
 
-   check_rowlen(con, db, names, fixed, fill, b)
+   check_rowlen(con, db, names, shape, b)
+end
+
+--
+-- 列类型自检（§4.1.1 第 2 步）：对全类型表调 PERCONA_RAFT_SCHEMA_MANIFEST()，
+-- 期望**不出现 UNSUPPORTED_COLUMN**。服务端收窄类型面时这里会具名失败并指出是哪一列。
+-- 注意它抓不到"服务端**放宽**"（新增类型不改变已有表的指纹）——那只能靠 build commit 比对。
+--
+local function cmd_typescheck()
+   local db = sql_ident(sysbench.opt.schema_db)
+   if db == "" then die("必须给 --schema-db") end
+   local names = {}
+   for _, n in ipairs(table_names()) do names[#names + 1] = n end
+   local tables = table.concat(names, ",")
+
+   local con = connect()
+   -- 目标上**没有**这个函数（原生发行版/更老的构建）时是"目标差异"，不是失败（§3.3）：
+   -- 用 pcall 抓住 SQL 错误，只有 1305 FUNCTION does not exist 才按 SKIP 处理。
+   local ok, row = pcall(function()
+      return con:query_row(string.format(
+         "SELECT PERCONA_RAFT_SCHEMA_MANIFEST('%s', '%s')", db, tables))
+   end)
+   if not ok then
+      local err = tostring(row)
+      if err:find("1305") or err:lower():find("does not exist") then
+         print(string.format(
+            "raft_prepare.typescheck.SKIP=目标上没有 PERCONA_RAFT_SCHEMA_MANIFEST()" ..
+            "（不是我们的构建 ⇒ 类型面无从自检，这也**不是**失败）：%s", err))
+         return
+      end
+      die("调用 PERCONA_RAFT_SCHEMA_MANIFEST() 失败：%s", err)
+   end
+   if row == nil then
+      die("PERCONA_RAFT_SCHEMA_MANIFEST() 没有返回结果")
+   end
+
+   local result = row:match('"result"%s*:%s*"([^"]*)"')
+   print(string.format("raft_prepare.typescheck.schema=%s tables=%s types=%s columns=%d",
+                       db, tables, sysbench.opt.types,
+                       #make_shape(sysbench.opt.row_length, sysbench.opt.index_profile,
+                                   sysbench.opt.types).cols))
+
+   if result == nil then
+      die("返回里没有 result 字段，无法判定：%s", row)
+   end
+
+   -- 非 Raft 实例上控制类函数返回 UNAVAILABLE ⇒ 按 §3.3"目标差异不是漂移"处理：跳过而**不是**失败
+   if result == "UNAVAILABLE" then
+      print(string.format("raft_prepare.typescheck.SKIP=%s（该实例没有 Raft 运行时，" ..
+                          "无法派生 manifest；这不是类型面的失败）", result))
+      return
+   end
+
+   if result ~= "OK" then
+      -- 具名失败：把整段 JSON 打出来（里面有 UNSUPPORTED_COLUMN 与列名）
+      print(string.format("raft_prepare.typescheck.FAIL=%s", result))
+      print(string.format("raft_prepare.typescheck.json=%s", row))
+      die("列类型自检失败：result=%s（若是 UNSUPPORTED_COLUMN，说明工具这份清单与服务端矩阵不一致，" ..
+          "**不许静默跳过那一列**）", result)
+   end
+
+   -- 再单独查一次"有没有 UNSUPPORTED_COLUMN 字样"，防止 result 是 OK 但细节里有异常列
+   if row:find("UNSUPPORTED_COLUMN") then
+      print(string.format("raft_prepare.typescheck.json=%s", row))
+      die("返回里出现 UNSUPPORTED_COLUMN：工具的类型清单与服务端不一致")
+   end
+
+   print(string.format("raft_prepare.typescheck.PASS=%d 列全部被服务端接受", 
+                       #make_shape(sysbench.opt.row_length, sysbench.opt.index_profile,
+                                   sysbench.opt.types).cols))
 end
 
 local function cmd_rowlen()
    local db = sql_ident(sysbench.opt.schema_db)
    if db == "" then die("必须给 --schema-db") end
-   check_types()
    local b = sysbench.opt.row_length
-   local cols, fixed, fill, idx = table_shape(b, sysbench.opt.index_profile)
-   check_rowlen(connect(), db, table_names(), fixed, fill, b)
+   local shape = make_shape(b, sysbench.opt.index_profile, sysbench.opt.types)
+   check_rowlen(connect(), db, table_names(), shape, b)
 end
 
 --
@@ -401,4 +640,5 @@ sysbench.cmdline.commands = {
    ddl = {cmd_ddl},
    prepare = {cmd_prepare},
    rowlen = {cmd_rowlen},
+   typescheck = {cmd_typescheck},
 }
