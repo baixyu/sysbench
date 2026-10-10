@@ -155,6 +155,11 @@ local function builtin_shape(b, profile)
    cols[#cols + 1] = "k INT NOT NULL"
    fixed = fixed + FIXED_BYTES.k
 
+   -- pad VARCHAR(60)（内容恒 60 字节）：补上它，工具生成的表就**与原版 oltp_*.lua 兼容**
+   -- （原版脚本的语句里带 pad；没有这一列连 prepare 都过不去：1054 Unknown column 'pad'）。
+   -- 它同时参与行长（恒 60 字节），所以 target 要把它扣掉。列定义加在**最后**（读起来与 stock 一致）。
+   local PAD_BYTES = 60
+
    -- pk_secondary（§4.2）= 主键 + 二级索引 + **唯一索引**。
    -- 唯一索引必须有天然唯一的列：`k` 取 (id*7) % 100000、>10 万行就会撞，
    -- 所以另加一列 u（= id*1000003，逐行唯一），别拿会撞的列去建 UNIQUE。
@@ -165,11 +170,11 @@ local function builtin_shape(b, profile)
 
    local target = 0
    if b > 0 then
-      target = b - fixed
+      target = b - fixed - PAD_BYTES
       if target < 2 then
-         die("目标行长 B=%d 太小：必需列（id INT + k INT）已经要 %d 字节，" ..
-             "填充列至少还要 2 字节内容才能形成分布。最小可行 B = %d",
-             b, fixed, fixed + 2)
+         die("目标行长 B=%d 太小：必需列（id INT + k INT = %d 字节）+ pad(%d 字节)" ..
+             "已经占满，填充列至少还要 2 字节内容才能形成分布。最小可行 B = %d",
+             b, fixed, PAD_BYTES, fixed + PAD_BYTES + 2)
       end
       local headroom = math.max(16, math.floor(target * 0.3))
       local n = target + headroom
@@ -178,14 +183,19 @@ local function builtin_shape(b, profile)
                          target = target}
    end
 
+   cols[#cols + 1] = "pad VARCHAR(60) NOT NULL"
+
    -- INSERT 的列名表由**形状**决定，别再硬编码（硬编码 "id,k,c" 在加列后会漏列：
    -- 实测踩到过——表建好了、灌数整条语句报错，而外面只看 "created" 还以为成功）
    local names = {"id", "k"}
    if profile == "pk_secondary" then names[#names + 1] = "u" end
    if b > 0 then names[#names + 1] = "c" end
+   names[#names + 1] = "pad"
 
    return {
       cols = cols, fixed = fixed, fill = fill, target = target,
+      -- pad 是"内容长度固定的变长列"：进实测表达式（LENGTH(pad)=60），但不参与分布
+      var_cols = {"pad"}, var_bytes = PAD_BYTES,
       insert_cols = table.concat(names, ","),
       idx = (profile == "pk_secondary")
             and "PRIMARY KEY (id), KEY k_k (k), UNIQUE KEY u_uniq (u)"
@@ -198,6 +208,7 @@ local function builtin_shape(b, profile)
          if fill[1] ~= nil then
             v[#v + 1] = "'" .. ascii_of(rng, lens[((i - 1) % #lens) + 1], "r" .. id) .. "'"
          end
+         v[#v + 1] = string.rep("'", 0) .. "'" .. string.rep("p", 60) .. "'"
          return v
       end,
    }
