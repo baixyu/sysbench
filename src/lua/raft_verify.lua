@@ -74,7 +74,7 @@ local function table_list()
 end
 
 -- 列清单 / 主键：从 information_schema 推导（不手抄）
-local function derive_columns(con, db, tbl)
+local function derive_columns(con, db, tbl, need_pk)
    local cols = {}
    local rs = con:query(string.format(
       "SELECT column_name FROM information_schema.columns " ..
@@ -100,9 +100,13 @@ local function derive_columns(con, db, tbl)
       local r2 = rs2:fetch_row()
       rs2:free()
       if r2 == nil then
-         die("表 %s.%s 没有主键；dump 需要稳定顺序，请用 --pk-column 显式指定一列", db, tbl)
+         if need_pk then
+            die("表 %s.%s 没有主键；dump 需要稳定顺序，请用 --pk-column 显式指定一列", db, tbl)
+         end
+         pk = "(none)"
+      else
+         pk = r2[1]
       end
-      pk = r2[1]
    end
    return cols, pk
 end
@@ -131,7 +135,7 @@ local function cmd_aggregate()
    local con = connect()
 
    for _, tbl in ipairs(table_list()) do
-      local cols, pk = derive_columns(con, db, tbl)
+      local cols, pk = derive_columns(con, db, tbl, false)  -- 聚合不需要主键（实测：只有 UNIQUE 键的表曾被挡住）
       local expr = digest_expr(cols)
       if not sysbench.opt.quiet then
          print(string.format("raft_verify.columns=%s.%s pk=%s ncols=%d list=%s",
@@ -158,7 +162,7 @@ local function cmd_dump()
    local con = connect()
 
    for _, tbl in ipairs(table_list()) do
-      local cols, pk = derive_columns(con, db, tbl)
+      local cols, pk = derive_columns(con, db, tbl, true)   -- dump 需要稳定顺序
       local expr = digest_expr(cols)
       local limit = sysbench.opt.limit
       local tail = (limit > 0) and (" LIMIT " .. limit) or ""
@@ -187,7 +191,7 @@ local function cmd_columns()
    if db == "" then die("必须给 --schema-db") end
    local con = connect()
    for _, tbl in ipairs(table_list()) do
-      local cols, pk = derive_columns(con, db, tbl)
+      local cols, pk = derive_columns(con, db, tbl, false)
       print(string.format("raft_verify.columns=%s.%s pk=%s ncols=%d list=%s",
                           db, tbl, pk, #cols, table.concat(cols, ",")))
       print(string.format("raft_verify.digest_expr=%s.%s %s",

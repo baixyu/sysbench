@@ -29,6 +29,7 @@ SCHEMA_DB=""
 SCHEMA_TABLES=""
 USER=root
 LIMIT=0
+PK_COLUMN=""
 SKIP_DUMP=0
 SKIP_AGGREGATE=0
 TMPDIR_BASE=""
@@ -43,6 +44,7 @@ while [ $# -gt 0 ]; do
     --member=*) MEMBERS+=("${1#*=}"); shift;;
     --user=*) USER=${1#*=}; shift;;
     --limit=*) LIMIT=${1#*=}; shift;;
+    --pk-column=*) PK_COLUMN=${1#*=}; shift;;   # 没有主键的表（例如只有 UNIQUE 键）逐行 dump 时用它定序
     --skip-dump) SKIP_DUMP=1; shift;;
     --skip-aggregate) SKIP_AGGREGATE=1; shift;;
     --tmpdir=*) TMPDIR_BASE=${1#*=}; shift;;
@@ -67,7 +69,8 @@ run_verify() { # <host> <port> <command>
   local host=$1 port=$2 cmd=$3
   "$SYSBENCH" ./src/lua/raft_verify.lua \
      --mysql-host="$host" --mysql-port="$port" --mysql-user="$USER" --mysql-db="$SCHEMA_DB" \
-     --schema-db="$SCHEMA_DB" --schema-tables="$SCHEMA_TABLES" --limit="$LIMIT" "$cmd"
+     --schema-db="$SCHEMA_DB" --schema-tables="$SCHEMA_TABLES" --limit="$LIMIT" \
+     ${PK_COLUMN:+--pk-column="$PK_COLUMN"} "$cmd"
 }
 
 ########## 1) aggregate：快速失败信号 ##########
