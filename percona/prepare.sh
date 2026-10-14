@@ -34,6 +34,8 @@
 #     并把"按创建顺序补齐"的清单原样打出来（不给 --schema-tables 时本来就是自动发现的）。
 #
 # 选项：
+#   --mysql-cli-args="..."  原样追加给 mysql 客户端（例：--get-server-public-key / --ssl-mode=REQUIRED）
+#   --sysbench-args="..."   原样追加给所有 sysbench 调用（例：--mysql-ssl=on；也会透传给 raft_schema.sh/verify.sh）
 #   --preview-password=PW   预演实例的密码（缺省取 MYSQL_PWD）
 #   --leader-password=PW    Leader/成员 的密码（缺省取 MYSQL_PWD）
 #   --existing-tables=a,b   显式给出"在 force"的表集合（预检用；缺省= 清单里已存在的前缀）
@@ -57,15 +59,20 @@ SCHEMA_DB=
 MYSQL_DB=
 SCHEMA_TABLES=
 EXISTING_TABLES=
+EXISTING_GIVEN=0
 TABLE_PREFIX=sbtest
 TABLES=
-EXISTING_TABLES=
 SHAPE_ARGS=()          # 原样转发给 raft_prepare.lua 的参数
 PREVIEW_HOST=127.0.0.1; PREVIEW_PORT=; PREVIEW_USER=root
 LEADER_HOST=127.0.0.1;  LEADER_PORT=;  LEADER_USER=root
 # 密码：显式 --preview-password/--leader-password，或用 MYSQL_PWD 环境变量一次性给两边
 PREVIEW_PASSWORD=${MYSQL_PWD:-}
 LEADER_PASSWORD=${MYSQL_PWD:-}
+# 逃生口：原样追加给 mysql 客户端 / sysbench 的额外参数（分词规则同 shell）
+# 例：MYSQL_CLI_ARGS='--get-server-public-key' 或 '--ssl-mode=REQUIRED'
+CLI_EXTRA=(); SB_EXTRA=(); SB_EXTRA_STR=()
+[[ -n "${MYSQL_CLI_ARGS:-}" ]] && read -r -a CLI_EXTRA <<<"$MYSQL_CLI_ARGS"
+if [[ -n "${SYSBENCH_ARGS:-}" ]]; then SB_EXTRA_STR+=("$SYSBENCH_ARGS"); read -r -a SB_EXTRA <<<"$SYSBENCH_ARGS"; fi
 MEMBERS=()
 SKIP_DDL=0; SKIP_LOAD=0; DO_VERIFY=0; WAIT_APPLIED=1; ALLOW_NONEMPTY=0
 
@@ -79,12 +86,11 @@ while [[ $# -gt 0 ]]; do
     --schema-db) SCHEMA_DB=$2; SHAPE_ARGS+=(--schema-db="$2"); shift 2;;
     --mysql-db) MYSQL_DB=$2; shift 2;;
     --schema-tables) SCHEMA_TABLES=$2; shift 2;;
-    --existing-tables) EXISTING_TABLES=$2; shift 2;;
+    --existing-tables) EXISTING_TABLES=$2; EXISTING_GIVEN=1; shift 2;;
     --table-prefix) TABLE_PREFIX=$2; SHAPE_ARGS+=(--table-prefix="$2"); shift 2;;
     --tables) TABLES=$2; SHAPE_ARGS+=(--tables="$2"); shift 2;;
     --table-size|--row-length|--types|--index-profile|--seed|--batch|--rowlen-tolerance)
       SHAPE_ARGS+=("$1=$2"); shift 2;;
-    --existing-tables) EXISTING_TABLES=$2; shift 2;;
     --preview-host) PREVIEW_HOST=$2; shift 2;;
     --preview-port) PREVIEW_PORT=$2; shift 2;;
     --preview-user) PREVIEW_USER=$2; shift 2;;
@@ -93,6 +99,8 @@ while [[ $# -gt 0 ]]; do
     --leader-port) LEADER_PORT=$2; shift 2;;
     --leader-user) LEADER_USER=$2; shift 2;;
     --leader-password) LEADER_PASSWORD=$2; shift 2;;
+    --mysql-cli-args) read -r -a CLI_EXTRA <<<"$2"; shift 2;;
+    --sysbench-args) SB_EXTRA_STR+=("$2"); read -r -a SB_EXTRA <<<"$2"; shift 2;;
     --member) MEMBERS+=("$2"); shift 2;;
     --skip-ddl) SKIP_DDL=1; shift;;
     --skip-load) SKIP_LOAD=1; shift;;
@@ -114,19 +122,31 @@ done
 # 优先 MYSQL_CLI=/path/to/mysql，其次 PATH 里的 mysql（构建产物里的 mysql 一般在
 # <build>/runtime_output_directory/ 或 <build>/bin/ 下）。
 MYSQL_CLI=${MYSQL_CLI:-$(command -v mysql || true)}
-[[ -n "$MYSQL_CLI" && -x "$MYSQL_CLI" ]] || {
-  echo "找不到 mysql 客户端：请用 MYSQL_CLI=/path/to/mysql 指定" >&2
+if [[ -z "$MYSQL_CLI" || ! -x "$MYSQL_CLI" ]]; then
+  echo "找不到 mysql 客户端。" >&2
+  if [[ -z "$MYSQL_CLI" ]]; then
+    echo "  MYSQL_CLI 没设置，PATH 里也没有 mysql。" >&2
+  elif [[ ! -e "$MYSQL_CLI" ]]; then
+    echo "  MYSQL_CLI=$MYSQL_CLI —— 这个路径在本进程里不存在。" >&2
+  else
+    echo "  MYSQL_CLI=$MYSQL_CLI —— 这个文件不可执行（脚本要求 -x）。" >&2
+  fi
+  echo "  注意它必须是**这个脚本（子进程）能看到**的环境变量：" >&2
+  echo "    export MYSQL_CLI=<build>/runtime_output_directory/mysql     # 少了 export 就只有当前 shell 看得到" >&2
+  echo "    MYSQL_CLI=<build>/runtime_output_directory/mysql bash percona/prepare.sh ...   # 或者用前缀形式" >&2
+  echo "    sudo -E ... / 别的 shell / 容器里跑时，变量和这个路径都要在那一侧存在" >&2
+  echo "  没有客户端也可以装一个（这些查询是普通 SQL）：apt-get install -y mysql-client" >&2
   exit 2
-}
+fi
 
 # 对某个端点执行一条语句（--protocol=tcp + -Nse）。密码走 MYSQL_PWD 环境变量，
 # 只对这一次调用生效：不写进命令行，也就不会出现在 ps 的 argv 里。
 cli() { # <host> <port> <user> <password> <mysql 参数…>
   local h=$1 p=$2 u=$3 pw=$4; shift 4
   if [[ -n "$pw" ]]; then
-    MYSQL_PWD="$pw" "$MYSQL_CLI" --protocol=tcp -h"$h" -P"$p" -u"$u" "$@"
+    MYSQL_PWD="$pw" "$MYSQL_CLI" --protocol=tcp -h"$h" -P"$p" -u"$u" ${CLI_EXTRA[@]+"${CLI_EXTRA[@]}"} "$@"
   else
-    "$MYSQL_CLI" --protocol=tcp -h"$h" -P"$p" -u"$u" "$@"
+    "$MYSQL_CLI" --protocol=tcp -h"$h" -P"$p" -u"$u" ${CLI_EXTRA[@]+"${CLI_EXTRA[@]}"} "$@"
   fi
 }
 
@@ -163,6 +183,9 @@ if [[ -z "$LEADER_PORT" ]]; then
   [[ -n "$LEADER_PORT" ]] || { echo "没有成员报 LEADER（选举中？）——请稍后重试或显式给 --leader-port" >&2; exit 1; }
   echo "   Leader 端口：$LEADER_PORT"
 fi
+
+echo "=== 0) 连接：Leader ${LEADER_HOST}:${LEADER_PORT}（用户 ${LEADER_USER}）、预演实例 ${PREVIEW_HOST}:${PREVIEW_PORT}（用户 ${PREVIEW_USER}）、成员 ${#MEMBERS[@]} 个 ==="
+echo "    步骤顺序：① 算 DDL（不连库）→ ② 读 Leader 的 information_schema 发现已有基表 → ③ 逐张 transition（这里先用预演实例派生目标 manifest）→ ④ 灌数 + 行长回读（Leader）→ ⑤ 跨成员核对"
 
 # ── 1) 目标形状（DDL）────────────────────────────────────────────────────────
 echo "=== 1) 现算目标 DDL（raft_prepare.lua ddl）==="
@@ -201,7 +224,12 @@ ALL_LOAD_NAMES=("${DDL_NAMES[@]}")
 SUGGESTED_LIST=""
 existing_rows=$(q "$LEADER_PORT" "SELECT table_name FROM information_schema.tables WHERE table_schema='$SCHEMA_DB' AND table_type='BASE TABLE' ORDER BY create_time IS NULL, create_time, table_name")
 rc=$?
-[[ $rc -eq 0 ]] || { echo "读 $SCHEMA_DB 的现有基表失败：$existing_rows" >&2; exit 1; }
+[[ $rc -eq 0 ]] || {
+  echo "读 ${SCHEMA_DB} 的现有基表失败（Leader ${LEADER_HOST}:${LEADER_PORT}，用户 ${LEADER_USER}）：" >&2
+  echo "$existing_rows" >&2
+  echo "  —— 这一步连的是 **Leader**（用 --leader-host/--leader-port 指定，或用 --member 自动探测）；" >&2
+  echo "     预演实例（--preview-host/--preview-port）要到逐张 transition 时才用。" >&2
+  exit 1; }
 EXISTING_DISCOVERED=""
 for e in $existing_rows; do EXISTING_DISCOVERED="${EXISTING_DISCOVERED:+$EXISTING_DISCOVERED,}$e"; done
 
@@ -220,6 +248,15 @@ while [[ $j -lt $NEW_COUNT ]]; do
   j=$((j + 1))
 done
 SUGGESTED_LIST="${EXISTING_DISCOVERED}${EXISTING_DISCOVERED:+${MISSING_CSV:+,}}$MISSING_CSV"
+if [[ -z "$EXISTING_DISCOVERED" && $EXISTING_GIVEN -eq 0 ]]; then
+  echo "拒绝：从 Leader ${LEADER_HOST}:${LEADER_PORT} 的 information_schema 看，库 ${SCHEMA_DB} 里**一张基表都没有**。" >&2
+  echo "  而集群的在册集不可能为空（服务端要求 manifest 至少 1 张表）⇒ 大概率是这三件事之一：" >&2
+  echo "    ① --schema-db 不是集群的**声明库**：在 Leader 上列出所有非系统库里的表，看哪个库有表；" >&2
+  echo "    ② --leader-host/--leader-port 指到了别的实例（不是集群的 Leader）：查 Percona_raft_state；" >&2
+  echo "    ③ 账号看不到 information_schema（权限不足）。" >&2
+  echo "  确认过确实要往一个空库加表时，显式声明在 force 集合（可空）： --existing-tables=" >&2
+  exit 1
+fi
 if [[ -n "$SCHEMA_TABLES" ]]; then
   echo "   （--schema-tables 显式给定：${SCHEMA_TABLES}）"
 else
@@ -325,6 +362,7 @@ else
       [[ -n "$FINAL_LOCAL" ]] && rs_args+=(--existing-tables="$FINAL_LOCAL")
       [[ -n "$PREVIEW_PASSWORD" ]] && rs_args+=(--preview-password="$PREVIEW_PASSWORD")
       [[ -n "$LEADER_PASSWORD" ]] && rs_args+=(--leader-password="$LEADER_PASSWORD")
+      [[ ${#SB_EXTRA_STR[@]} -gt 0 ]] && rs_args+=(--sysbench-args="${SB_EXTRA_STR[*]}")
       if preview_has_table "$t"; then
         echo "   （预演实例上已有 $t ⇒ 传 --skip-ddl，避免重复执行 DDL）"
         rs_args+=(--skip-ddl)
@@ -357,6 +395,7 @@ else
   echo "=== 4) 灌数 + 行长回读（prepare --skip-ddl）==="
   load_args=(--mysql-host="$LEADER_HOST" --mysql-port="$LEADER_PORT" --mysql-user="$LEADER_USER")
   [[ -n "$LEADER_PASSWORD" ]] && load_args+=(--mysql-password="$LEADER_PASSWORD")
+  [[ ${#SB_EXTRA[@]} -gt 0 ]] && load_args+=(${SB_EXTRA[@]+"${SB_EXTRA[@]}"})
   "$SYSBENCH" "$LUA_PREPARE" "${SHAPE_ARGS[@]}" --mysql-db="$MYSQL_DB" \
     "${load_args[@]}" --skip-ddl prepare
   rc=$?
@@ -372,6 +411,7 @@ if [[ "$DO_VERIFY" -eq 1 ]]; then
     v_args=(--sysbench="$SYSBENCH" --schema-db="$SCHEMA_DB" --schema-tables="$SCHEMA_TABLES" \
             --user="$LEADER_USER" --skip-dump)
     [[ -n "$LEADER_PASSWORD" ]] && v_args+=(--password="$LEADER_PASSWORD")
+    [[ ${#SB_EXTRA_STR[@]} -gt 0 ]] && v_args+=(--sysbench-args="${SB_EXTRA_STR[*]}")
     for m in "${MEMBERS[@]}"; do v_args+=(--member "$m"); done
     "$VERIFY_SCRIPT" "${v_args[@]}" || { echo "跨成员核对失败" >&2; exit 1; }
   fi

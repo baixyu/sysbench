@@ -48,6 +48,28 @@ sysbench 两条路都会拒）；`--leader-password/--preview-password` 与 `MYS
 （自动发现、预检、预演实例执行 DDL 并派生指纹、`verify.sh` 聚合 `verify.result=PASS`、
 `doctor.sh` `check1_connect=PASS`）。
 
+**逃生口**（连接层以外的参数原样往下传，分词规则同 shell）：
+
+| 参数 / 环境变量 | 作用 |
+| --- | --- |
+| `--mysql-cli-args="..."`（env `MYSQL_CLI_ARGS`） | 追加给 **mysql 客户端**的每次调用。例：`--get-server-public-key`、`--ssl-mode=REQUIRED` |
+| `--sysbench-args="..."`（env `SYSBENCH_ARGS`） | 追加给**所有 sysbench 调用**；`prepare.sh` 会透传给 `raft_schema.sh` / `verify.sh`。例：`--mysql-ssl=on --mysql-ssl-cipher=...` |
+
+**`caching_sha2_password` 的坑（实测）**：账号有密码时，**非 TLS 且客户端没要服务端公钥**的连接会被服务端
+直接拒：`ERROR 2061 (HY000): Authentication plugin 'caching_sha2_password' reported error: Authentication
+requires secure connection.`（认证**冷缓存**时必现；成功认证一次后走 fast path，`FLUSH PRIVILEGES` /
+重启会清掉缓存。）四种出路，都实测过：
+
+- `--mysql-cli-args="--get-server-public-key"` —— 不用 TLS 也能过（RSA 交换）；
+- `--mysql-cli-args="--ssl-mode=REQUIRED"` —— 走 TLS（实测 `Ssl_cipher=TLS_AES_128_GCM_SHA256`），
+  需要服务端有证书、客户端编译了 SSL 支持；
+- 把缓存喂热：先用能过的客户端认证一次，之后的明文连接走 fast path（一次性，别指望它稳）；
+- 换 `mysql_native_password`：**8.4 默认没加载该插件**（实测 `ERROR 1524 Plugin
+  'mysql_native_password' is not loaded`），要用得在服务端加 `--mysql-native-password=ON`，不建议。
+
+sysbench 那条路默认就会协商 TLS（libmysqlclient 默认 PREFERRED，而 `--mysql-ssl` 只能强制打开、不能关），
+所以一般不会撞 2061 —— 撞 2061 基本就是 **mysql 客户端那一条**：客户端没编译 SSL，或服务端 TLS 没开。
+
 ---
 
 ## 1. 构建（Ubuntu 24.04）

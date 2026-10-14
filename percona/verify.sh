@@ -29,6 +29,7 @@ SCHEMA_DB=""
 SCHEMA_TABLES=""
 USER=root
 PASSWORD=${MYSQL_PWD:-}
+SB_EXTRA=()
 LIMIT=0
 PK_COLUMN=""
 SKIP_DUMP=0
@@ -46,6 +47,7 @@ while [ $# -gt 0 ]; do
     --user=*) USER=${1#*=}; shift;;
     --password=*) PASSWORD=${1#*=}; shift;;
     --password) PASSWORD=$2; shift 2;;
+    --sysbench-args) read -r -a SB_EXTRA <<<"$2"; shift 2;;
     --limit=*) LIMIT=${1#*=}; shift;;
     --pk-column=*) PK_COLUMN=${1#*=}; shift;;   # 没有主键的表（例如只有 UNIQUE 键）逐行 dump 时用它定序
     --skip-dump) SKIP_DUMP=1; shift;;
@@ -72,6 +74,7 @@ run_verify() { # <host> <port> <command>
   local host=$1 port=$2 cmd=$3
   local pw_arg=()
   [[ -n "$PASSWORD" ]] && pw_arg=(--mysql-password="$PASSWORD")
+  [[ ${#SB_EXTRA[@]} -gt 0 ]] && pw_arg+=(${SB_EXTRA[@]+"${SB_EXTRA[@]}"})
   "$SYSBENCH" ./src/lua/raft_verify.lua "${pw_arg[@]}" \
      --mysql-host="$host" --mysql-port="$port" --mysql-user="$USER" --mysql-db="$SCHEMA_DB" \
      --schema-db="$SCHEMA_DB" --schema-tables="$SCHEMA_TABLES" --limit="$LIMIT" \
