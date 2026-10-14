@@ -221,7 +221,25 @@ ALL_LOAD_NAMES=("${DDL_NAMES[@]}")
 # 所以：**清单 = 现有基表 + 待建的表**，现有表必须原样带上（否则就是"removes N table(s)"）。
 # 缺省时这里自动发现它们；顺序取 information_schema 的 create_time（并列时按表名）——
 # 纯粹是好让声明顺序看起来像创建顺序，功能上不敏感（见上面"顺序自由"）。
+case "$SCHEMA_DB" in
+  mysql|sys|performance_schema|information_schema)
+    if [[ -z "$SCHEMA_TABLES" && $EXISTING_GIVEN -eq 0 ]]; then
+      echo "拒绝：--schema-db=$SCHEMA_DB 是**系统库**，自动发现会把几十张系统表当成在册集。" >&2
+      echo "  实测这样会撞：UNSUPPORTED_TABLE: table mysql.general_log is not an unpartitioned, trigger-free InnoDB table" >&2
+      echo "  （manifest 只描述无分区、无触发器的 InnoDB 表，schema_manifest_builder.cc:298-301）。" >&2
+      echo "  用某个系统表当 genesis 声明的集群（例如声明 mysql.raft_apply_receipts），请**显式**声明在册集：" >&2
+      echo "    --existing-tables=raft_apply_receipts        # 在 force 的那几张；--tables=N 会自动追加 sbtest1..N" >&2
+      echo "  或给出完整目标清单：--schema-tables=raft_apply_receipts,sbtest1,…" >&2
+      exit 1
+    fi;;
+esac
+
 SUGGESTED_LIST=""
+if [[ $EXISTING_GIVEN -eq 1 ]]; then
+  # 用户显式声明了在 force 集合：以它为准，不再用 information_schema 猜（系统库里"物理有"≠"在册"）
+  existing_rows="$EXISTING_TABLES"
+  echo "   （--existing-tables 显式声明在 force 集合：${EXISTING_TABLES:-（空）}；跳过自动发现）"
+else
 existing_rows=$(q "$LEADER_PORT" "SELECT table_name FROM information_schema.tables WHERE table_schema='$SCHEMA_DB' AND table_type='BASE TABLE' ORDER BY create_time IS NULL, create_time, table_name")
 rc=$?
 [[ $rc -eq 0 ]] || {
@@ -232,6 +250,8 @@ rc=$?
   exit 1; }
 EXISTING_DISCOVERED=""
 for e in $existing_rows; do EXISTING_DISCOVERED="${EXISTING_DISCOVERED:+$EXISTING_DISCOVERED,}$e"; done
+
+fi
 
 # 待建 = ddl 生成的表里，schema 里还没有的那些；已经存在的当作"在册"原样带上（不再 CREATE），
 # 所以"补建到 N 张"可以重复跑（--tables=8 而 sbtest1..3 已在 ⇒ 只建 4..8）。
@@ -321,11 +341,13 @@ echo "=== 2) 集群现状：已声明（存在）= ${EXISTING_PREFIX:-（无）}
 
 # 保护：该 schema 下若有"不在目标清单里"的基表，目标 manifest 会把它们挤出声明 → 拒绝
 extra=""
+if [[ $EXISTING_GIVEN -eq 0 ]]; then
 for t in $existing_rows; do
   in_target=0
   for x in "${TARGETS[@]}"; do [[ "$x" == "$t" ]] && in_target=1; done
   [[ $in_target -eq 0 ]] && extra="${extra:+$extra,}$t"
 done
+fi
 if [[ -n "$extra" ]]; then
   echo "拒绝：schema $SCHEMA_DB 里还有不在目标清单里的基表：$extra" >&2
   echo "  声明集只能追加（见 §2）：这些表若在册，按现在的清单提案会把它们从声明里挤掉，服务端必定以" >&2
@@ -369,7 +391,10 @@ else
       fi
       [[ $WAIT_APPLIED -eq 1 ]] && rs_args+=(--wait-applied)
       for m in "${MEMBERS[@]}"; do rs_args+=(--member "$m"); done
-      "$SCHEMA_SCRIPT" "${rs_args[@]}" || { echo "transition 失败：$t" >&2; exit 1; }
+      "$SCHEMA_SCRIPT" "${rs_args[@]}" || {
+        echo "transition 失败：$t" >&2
+        echo "  （若上面显示 propose=PASS/APPLIED，则这一步其实已经落地，只是后续核对失败——重跑会自动跳过已建好的表。）" >&2
+        exit 1; }
       FINAL_LOCAL="${FINAL_LOCAL:+$FINAL_LOCAL,}$t"
       i=$((i + 1))
     done

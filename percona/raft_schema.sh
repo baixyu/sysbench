@@ -197,6 +197,7 @@ echo "=== 3/3 verify：逐成员核对 epoch 与本机自派生指纹 ==="
 if [[ ${#MEMBERS[@]} -eq 0 ]]; then
   echo "（未给 --member，跳过逐成员校验；建议至少把三台都列上）"
 else
+  failed_members=""
   for m in "${MEMBERS[@]}"; do
     host=${m%%:*}; port=${m##*:}
     member_conn=(--mysql-host="$host" --mysql-port="$port" --mysql-user="$LEADER_USER" --mysql-db="$SCHEMA_DB")
@@ -208,7 +209,10 @@ else
     echo "member ${host}:${port}: $(tr '\n' ' ' <<<"$out" | sed 's/sysbench 1[^)]*)//')"
     [[ $mrc -eq 0 ]] || failed_members="${failed_members:+$failed_members }${host}:${port}"
   done
-  [[ -z "$failed_members" ]] || { echo "verify 失败：这些成员没核对通过：$failed_members" >&2; exit 1; }
+  [[ -z "${failed_members:-}" ]] || {
+    echo "verify 失败：提案**已经 APPLIED**（上面 propose=PASS，epoch 已推进），但这些成员的现派生指纹没核对上：$failed_members" >&2
+    echo "  ⇒ 表和声明都已落地，别当成"建表失败"重来；先单独核对这几台（例如用 raft_schema.sh verify 或手跑 PERCONA_RAFT_SCHEMA_MANIFEST 比指纹）。" >&2
+    exit 1; }
 fi
 
 echo "=== raft_schema: PASS（指纹 ${fingerprint}，epoch 见上）==="
