@@ -28,6 +28,7 @@ SYSBENCH=./src/sysbench
 SCHEMA_DB=""
 SCHEMA_TABLES=""
 USER=root
+PASSWORD=${MYSQL_PWD:-}
 LIMIT=0
 PK_COLUMN=""
 SKIP_DUMP=0
@@ -43,6 +44,8 @@ while [ $# -gt 0 ]; do
     --member) MEMBERS+=("$2"); shift 2;;
     --member=*) MEMBERS+=("${1#*=}"); shift;;
     --user=*) USER=${1#*=}; shift;;
+    --password=*) PASSWORD=${1#*=}; shift;;
+    --password) PASSWORD=$2; shift 2;;
     --limit=*) LIMIT=${1#*=}; shift;;
     --pk-column=*) PK_COLUMN=${1#*=}; shift;;   # 没有主键的表（例如只有 UNIQUE 键）逐行 dump 时用它定序
     --skip-dump) SKIP_DUMP=1; shift;;
@@ -67,7 +70,9 @@ base=${MEMBERS[0]##*:}
 
 run_verify() { # <host> <port> <command>
   local host=$1 port=$2 cmd=$3
-  "$SYSBENCH" ./src/lua/raft_verify.lua \
+  local pw_arg=()
+  [[ -n "$PASSWORD" ]] && pw_arg=(--mysql-password="$PASSWORD")
+  "$SYSBENCH" ./src/lua/raft_verify.lua "${pw_arg[@]}" \
      --mysql-host="$host" --mysql-port="$port" --mysql-user="$USER" --mysql-db="$SCHEMA_DB" \
      --schema-db="$SCHEMA_DB" --schema-tables="$SCHEMA_TABLES" --limit="$LIMIT" \
      ${PK_COLUMN:+--pk-column="$PK_COLUMN"} "$cmd"

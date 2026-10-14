@@ -38,6 +38,8 @@ DDL=
 DDL_FILE=
 PREVIEW_HOST=127.0.0.1; PREVIEW_PORT=; PREVIEW_USER=root
 LEADER_HOST=127.0.0.1;  LEADER_PORT=;  LEADER_USER=root
+PREVIEW_PASSWORD=${MYSQL_PWD:-}
+LEADER_PASSWORD=${MYSQL_PWD:-}
 MEMBERS=()
 WAIT_APPLIED=0
 SKIP_DDL=0
@@ -67,9 +69,11 @@ while [[ $# -gt 0 ]]; do
     --preview-host) PREVIEW_HOST=$2; shift 2;;
     --preview-port) PREVIEW_PORT=$2; shift 2;;
     --preview-user) PREVIEW_USER=$2; shift 2;;
+    --preview-password) PREVIEW_PASSWORD=$2; shift 2;;
     --leader-host) LEADER_HOST=$2; shift 2;;
     --leader-port) LEADER_PORT=$2; shift 2;;
     --leader-user) LEADER_USER=$2; shift 2;;
+    --leader-password) LEADER_PASSWORD=$2; shift 2;;
     --member) MEMBERS+=("$2"); shift 2;;
     --wait-applied) WAIT_APPLIED=1; shift;;
     --skip-ddl) SKIP_DDL=1; shift;;
@@ -92,6 +96,8 @@ ddl_args=()
 common=(--schema-db="$SCHEMA_DB" --schema-tables="$SCHEMA_TABLES")
 preview_conn=(--mysql-host="$PREVIEW_HOST" --mysql-port="$PREVIEW_PORT" --mysql-user="$PREVIEW_USER" --mysql-db="$SCHEMA_DB")
 leader_conn=(--mysql-host="$LEADER_HOST" --mysql-port="$LEADER_PORT" --mysql-user="$LEADER_USER" --mysql-db="$SCHEMA_DB")
+[[ -n "$PREVIEW_PASSWORD" ]] && preview_conn+=(--mysql-password="$PREVIEW_PASSWORD")
+[[ -n "$LEADER_PASSWORD" ]]  && leader_conn+=(--mysql-password="$LEADER_PASSWORD")
 
 # DDL 类型（只用于把"在 force 的表集合"推出来；推不出来就要求 --existing-tables）
 ddl_head="$DDL"
@@ -161,8 +167,9 @@ if [[ ${#MEMBERS[@]} -eq 0 ]]; then
 else
   for m in "${MEMBERS[@]}"; do
     host=${m%%:*}; port=${m##*:}
-    out=$("$SYSBENCH" "$LUA" --mysql-host="$host" --mysql-port="$port" \
-            --mysql-user="$LEADER_USER" --mysql-db="$SCHEMA_DB" \
+    member_conn=(--mysql-host="$host" --mysql-port="$port" --mysql-user="$LEADER_USER" --mysql-db="$SCHEMA_DB")
+    [[ -n "$LEADER_PASSWORD" ]] && member_conn+=(--mysql-password="$LEADER_PASSWORD")
+    out=$("$SYSBENCH" "$LUA" "${member_conn[@]}" \
             "${common[@]}" --expect-fingerprint="$fingerprint" verify)
     echo "member ${host}:${port}: $(tr '\n' ' ' <<<"$out" | sed 's/sysbench 1[^)]*)//')"
   done

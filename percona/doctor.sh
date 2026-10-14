@@ -43,9 +43,11 @@ while [[ $# -gt 0 ]]; do
     --target-host) TARGET_HOST=$2; shift 2;;
     --target-port) TARGET_PORT=$2; shift 2;;
     --target-user) TARGET_USER=$2; shift 2;;
+    --target-password) TARGET_PASSWORD=$2; shift 2;;
     --preview-host) PREVIEW_HOST=$2; shift 2;;
     --preview-port) PREVIEW_PORT=$2; shift 2;;
     --preview-user) PREVIEW_USER=$2; shift 2;;
+    --preview-password) PREVIEW_PASSWORD=$2; shift 2;;
     --golden-dir) GOLDEN_DIR=$2; shift 2;;
     --require-raft) REQUIRE_RAFT=1; shift;;
     *) echo "未知参数：$1" >&2; exit 2;;
@@ -60,8 +62,9 @@ raft_arg=()
 target_out=/tmp/doctor-target.out
 echo "=== 1/2 doctor：对目标 ${TARGET_HOST}:${TARGET_PORT} 跑检查 1/2/4/5/6/7 ==="
 set +e
+target_pw=(); [[ -n "${TARGET_PASSWORD:-}" ]] && target_pw=(--mysql-password="$TARGET_PASSWORD")
 "$SYSBENCH" "$LUA" --mysql-host="$TARGET_HOST" --mysql-port="$TARGET_PORT" \
-  --mysql-user="$TARGET_USER" --mysql-db=mysql \
+  --mysql-user="$TARGET_USER" "${target_pw[@]}" --mysql-db=mysql \
   --golden-dir="$GOLDEN_DIR" "${raft_arg[@]}" doctor > "$target_out" 2>&1
 target_rc=$?
 set -e
@@ -72,8 +75,9 @@ if [[ -n "$PREVIEW_PORT" ]]; then
   golden_out=/tmp/doctor-golden.out
   echo "=== 2/2 golden-check：对预演实例 ${PREVIEW_HOST}:${PREVIEW_PORT} 跑检查 3 ==="
   set +e
+  preview_pw=(); [[ -n "${PREVIEW_PASSWORD:-}" ]] && preview_pw=(--mysql-password="$PREVIEW_PASSWORD")
   "$SYSBENCH" "$LUA" --mysql-host="$PREVIEW_HOST" --mysql-port="$PREVIEW_PORT" \
-    --mysql-user="$PREVIEW_USER" --mysql-db=mysql \
+    --mysql-user="$PREVIEW_USER" "${preview_pw[@]}" --mysql-db=mysql \
     --golden-dir="$GOLDEN_DIR" golden-check > "$golden_out" 2>&1
   golden_rc=$?
   set -e

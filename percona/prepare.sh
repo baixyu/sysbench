@@ -34,6 +34,8 @@
 #     并把"按创建顺序补齐"的清单原样打出来（不给 --schema-tables 时本来就是自动发现的）。
 #
 # 选项：
+#   --preview-password=PW   预演实例的密码（缺省取 MYSQL_PWD）
+#   --leader-password=PW    Leader/成员 的密码（缺省取 MYSQL_PWD）
 #   --existing-tables=a,b   显式给出"在 force"的表集合（预检用；缺省= 清单里已存在的前缀）
 #   --skip-ddl              只灌数（等价于直接跑 raft_prepare --skip-ddl）
 #   --skip-load             只建表不灌数
@@ -61,6 +63,9 @@ EXISTING_TABLES=
 SHAPE_ARGS=()          # 原样转发给 raft_prepare.lua 的参数
 PREVIEW_HOST=127.0.0.1; PREVIEW_PORT=; PREVIEW_USER=root
 LEADER_HOST=127.0.0.1;  LEADER_PORT=;  LEADER_USER=root
+# 密码：显式 --preview-password/--leader-password，或用 MYSQL_PWD 环境变量一次性给两边
+PREVIEW_PASSWORD=${MYSQL_PWD:-}
+LEADER_PASSWORD=${MYSQL_PWD:-}
 MEMBERS=()
 SKIP_DDL=0; SKIP_LOAD=0; DO_VERIFY=0; WAIT_APPLIED=1; ALLOW_NONEMPTY=0
 
@@ -83,9 +88,11 @@ while [[ $# -gt 0 ]]; do
     --preview-host) PREVIEW_HOST=$2; shift 2;;
     --preview-port) PREVIEW_PORT=$2; shift 2;;
     --preview-user) PREVIEW_USER=$2; shift 2;;
+    --preview-password) PREVIEW_PASSWORD=$2; shift 2;;
     --leader-host) LEADER_HOST=$2; shift 2;;
     --leader-port) LEADER_PORT=$2; shift 2;;
     --leader-user) LEADER_USER=$2; shift 2;;
+    --leader-password) LEADER_PASSWORD=$2; shift 2;;
     --member) MEMBERS+=("$2"); shift 2;;
     --skip-ddl) SKIP_DDL=1; shift;;
     --skip-load) SKIP_LOAD=1; shift;;
@@ -112,16 +119,27 @@ MYSQL_CLI=${MYSQL_CLI:-$(command -v mysql || true)}
   exit 2
 }
 
-# 对 Leader 执行一条语句（--protocol=tcp + -Nse；返回制表符分隔的行）
+# 对某个端点执行一条语句（--protocol=tcp + -Nse）。密码走 MYSQL_PWD 环境变量，
+# 只对这一次调用生效：不写进命令行，也就不会出现在 ps 的 argv 里。
+cli() { # <host> <port> <user> <password> <mysql 参数…>
+  local h=$1 p=$2 u=$3 pw=$4; shift 4
+  if [[ -n "$pw" ]]; then
+    MYSQL_PWD="$pw" "$MYSQL_CLI" --protocol=tcp -h"$h" -P"$p" -u"$u" "$@"
+  else
+    "$MYSQL_CLI" --protocol=tcp -h"$h" -P"$p" -u"$u" "$@"
+  fi
+}
+
+# 对 Leader 执行一条语句（返回制表符分隔的行）
 q() { # <port> <sql>
-  "$MYSQL_CLI" --protocol=tcp -h"$LEADER_HOST" -P"$1" -u"$LEADER_USER" -Nse "$2"
+  cli "$LEADER_HOST" "$1" "$LEADER_USER" "$LEADER_PASSWORD" -Nse "$2"
 }
 
 # 预演实例上是否已经有这张表：上一次失败的尝试可能已经把 DDL 在预演实例上执行过了，
 # 再执行一次会撞 1050（表已存在）⇒ 这种情况给 raft_schema.sh 传 --skip-ddl（它就是为这个准备的）。
 preview_has_table() { # <table>
   local n
-  n=$("$MYSQL_CLI" --protocol=tcp -h"$PREVIEW_HOST" -P"$PREVIEW_PORT" -u"$PREVIEW_USER" -Nse \
+  n=$(cli "$PREVIEW_HOST" "$PREVIEW_PORT" "$PREVIEW_USER" "$PREVIEW_PASSWORD" -Nse \
       "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$SCHEMA_DB' AND table_name='$1'" 2>/dev/null)
   [[ "$n" == "1" ]]
 }
@@ -131,7 +149,7 @@ leader_port_probe() { # 从 --member 里挑 state=LEADER 的那台
   for m in "${MEMBERS[@]:-}"; do
     [[ -n "$m" ]] || continue
     host=${m%%:*}; port=${m##*:}
-    st=$("$MYSQL_CLI" --protocol=tcp -h"$host" -P"$port" -u"$LEADER_USER" -Nse \
+    st=$(cli "$host" "$port" "$LEADER_USER" "$LEADER_PASSWORD" -Nse \
          "SHOW STATUS LIKE 'Percona_raft_state'" 2>/dev/null | awk '{print $2}')
     if [[ "$st" == "LEADER" ]]; then found="$port"; fi
   done
@@ -305,6 +323,8 @@ else
                --preview-host="$PREVIEW_HOST" --preview-port="$PREVIEW_PORT" --preview-user="$PREVIEW_USER" \
                --leader-host="$LEADER_HOST" --leader-port="$LEADER_PORT" --leader-user="$LEADER_USER")
       [[ -n "$FINAL_LOCAL" ]] && rs_args+=(--existing-tables="$FINAL_LOCAL")
+      [[ -n "$PREVIEW_PASSWORD" ]] && rs_args+=(--preview-password="$PREVIEW_PASSWORD")
+      [[ -n "$LEADER_PASSWORD" ]] && rs_args+=(--leader-password="$LEADER_PASSWORD")
       if preview_has_table "$t"; then
         echo "   （预演实例上已有 $t ⇒ 传 --skip-ddl，避免重复执行 DDL）"
         rs_args+=(--skip-ddl)
@@ -335,9 +355,10 @@ else
     done
   fi
   echo "=== 4) 灌数 + 行长回读（prepare --skip-ddl）==="
+  load_args=(--mysql-host="$LEADER_HOST" --mysql-port="$LEADER_PORT" --mysql-user="$LEADER_USER")
+  [[ -n "$LEADER_PASSWORD" ]] && load_args+=(--mysql-password="$LEADER_PASSWORD")
   "$SYSBENCH" "$LUA_PREPARE" "${SHAPE_ARGS[@]}" --mysql-db="$MYSQL_DB" \
-    --mysql-host="$LEADER_HOST" --mysql-port="$LEADER_PORT" --mysql-user="$LEADER_USER" \
-    --skip-ddl prepare
+    "${load_args[@]}" --skip-ddl prepare
   rc=$?
   [[ $rc -eq 0 ]] || { echo "灌数/行长回读失败（rc=${rc}）" >&2; exit $rc; }
 fi
@@ -350,6 +371,7 @@ if [[ "$DO_VERIFY" -eq 1 ]]; then
     echo "=== 5) 跨成员聚合核对 ==="
     v_args=(--sysbench="$SYSBENCH" --schema-db="$SCHEMA_DB" --schema-tables="$SCHEMA_TABLES" \
             --user="$LEADER_USER" --skip-dump)
+    [[ -n "$LEADER_PASSWORD" ]] && v_args+=(--password="$LEADER_PASSWORD")
     for m in "${MEMBERS[@]}"; do v_args+=(--member "$m"); done
     "$VERIFY_SCRIPT" "${v_args[@]}" || { echo "跨成员核对失败" >&2; exit 1; }
   fi

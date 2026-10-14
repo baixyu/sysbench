@@ -48,6 +48,8 @@ while [ $# -gt 0 ]; do
     --mysql-host=*) HOST=${1#*=}; shift;;
     --mysql-port=*) PORT=${1#*=}; shift;;
     --mysql-user=*) USER=${1#*=}; shift;;
+    --mysql-password=*) PASSWORD=${1#*=}; shift;;
+    --password=*) PASSWORD=${1#*=}; shift;;
     --mysql-db=*) DB=${1#*=}; shift;;
     --target=*) TARGET=${1#*=}; shift;;
     --read-consistency=*) READ_CONSISTENCY=${1#*=}; shift;;
@@ -89,8 +91,9 @@ echo "report.out=$REPORT"
 # 采样：状态量的差值以 --sample-port 那一台为准（写场景下就是 leader）
 LUA_REPORT=./src/lua/raft_report.lua
 sample() { # <file>
+  sample_pw=(); [ -n "${PASSWORD:-}" ] && sample_pw=(--mysql-password="$PASSWORD")
   "$SYSBENCH" "$LUA_REPORT" --mysql-host="$HOST" --mysql-port="$SAMPLE_PORT" \
-     --mysql-user="$USER" --mysql-db="${DB:-mysql}" --out="$1" sample > /dev/null 2>&1 \
+     --mysql-user="$USER" "${sample_pw[@]}" --mysql-db="${DB:-mysql}" --out="$1" sample > /dev/null 2>&1 \
      || echo "  （采样失败：$1）"
 }
 
@@ -99,6 +102,7 @@ sample "$BEFORE"
 
 echo "--- 跑负载：$SCENARIO ---"
 SB_ARGS=(--mysql-host="$HOST" --mysql-port="$PORT" --mysql-user="$USER" --mysql-db="$DB")
+[ -n "${PASSWORD:-}" ] && SB_ARGS+=(--mysql-password="$PASSWORD")
 [ -n "$TARGET" ] && SB_ARGS+=(--target="$TARGET")
 [ -n "$READ_CONSISTENCY" ] && SB_ARGS+=(--read-consistency="$READ_CONSISTENCY")
 [ -n "$THREADS" ] && SB_ARGS+=(--threads="$THREADS")
@@ -131,7 +135,7 @@ ENV_MEM=${ENV_MEM:-unknown}
 
 echo "--- 合成 report.json ---"
 "$SYSBENCH" "$LUA_REPORT" \
-   --mysql-host="$HOST" --mysql-port="$SAMPLE_PORT" --mysql-user="$USER" --mysql-db="${DB:-mysql}" \
+   --mysql-host="$HOST" --mysql-port="$SAMPLE_PORT" --mysql-user="$USER" "${sample_pw[@]}" --mysql-db="${DB:-mysql}" \
    --before="$BEFORE" --after="$AFTER" --sysbench-out="$SB_OUT" --report="$REPORT" \
    --scenario="$(basename "$SCENARIO")" --meta-target="$TARGET" --meta-read-consistency="$READ_CONSISTENCY" \
    --meta-threads="$THREADS" --meta-time="$TIME_S" --meta-events="$EVENTS" \

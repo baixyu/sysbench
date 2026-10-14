@@ -30,6 +30,24 @@ LEADER=$PORT
 4. **`--target` 三档**：`raft`（受管集群；探不到身份变量就 FATAL，故意不静默降级）、`mysql`（原生 MySQL）、
    `auto`（默认）。对原生实例用 `raft` 一定失败，这是设计。
 
+**账号密码**（2026-10-14 补，之前只有 `--*-user`，默认 `root` 无密码）：
+
+| 脚本 | 参数 | 默认 |
+| --- | --- | --- |
+| `prepare.sh`、`raft_schema.sh` | `--preview-user` / `--preview-password`（预演实例）、`--leader-user` / `--leader-password`（Leader 与各成员） | `root`，密码取 `MYSQL_PWD` |
+| `verify.sh` | `--user=` / `--password=` | 同上 |
+| `doctor.sh` | `--target-user/--target-password`、`--preview-user/--preview-password` | 同上 |
+| `report.sh` | `--mysql-user=` / `--mysql-password=` | 同上 |
+
+也可以不写任何密码参数，直接 `export MYSQL_PWD=<密码>` 一把梭（所有脚本都会读它当默认值）。
+客户端查询走 `MYSQL_PWD`（只对单次调用生效，**不进 `ps` 的 argv**）；转发给 sysbench 的那一份是
+`--mysql-password=`，它会出现在 `ps` 里 —— 在意的话就用 `MYSQL_PWD`。
+
+实测（2026-10-14，一个 `rafter`/`pw123` 的实例）：不给密码 ⇒ `ERROR 1045 Access denied`（客户端与
+sysbench 两条路都会拒）；`--leader-password/--preview-password` 与 `MYSQL_PWD` 两种给法都能过
+（自动发现、预检、预演实例执行 DDL 并派生指纹、`verify.sh` 聚合 `verify.result=PASS`、
+`doctor.sh` `check1_connect=PASS`）。
+
 ---
 
 ## 1. 构建（Ubuntu 24.04）
