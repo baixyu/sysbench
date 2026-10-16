@@ -42,6 +42,10 @@
 #   --skip-ddl              只灌数（等价于直接跑 raft_prepare --skip-ddl）
 #   --skip-load             只建表不灌数
 #   --verify                结束时做跨成员聚合核对（percona/verify.sh --skip-dump）
+#   --monitor               整条流程用 percona/monitor.sh 包住：三台同时采状态量，跑完自动判读
+#                           "慢在哪条腿"（apply 滞后/日志滞后/commit gate/许可/快照），报告落在 --monitor-out-dir
+#   --monitor-interval-ms=N 采样间隔（默认 1000）
+#   --monitor-out-dir=DIR   报告目录（默认 /tmp/raft-mon.<时间戳>）
 #   --allow-nonempty        允许对非空表灌数（默认拒绝）
 #   --no-wait-applied       提案后不等本机应用完成（默认等待）
 #
@@ -49,11 +53,15 @@
 #
 set -uo pipefail
 
+# 原始参数要在**解析之前**存下来：解析过程会把 "$@" shift 掉，而 --monitor 的 re-exec 需要原样转发
+ORIG_ARGS=("$@")
+
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SYSBENCH=./src/sysbench
 LUA_PREPARE=${here}/../src/lua/raft_prepare.lua
 SCHEMA_SCRIPT=${here}/raft_schema.sh
 VERIFY_SCRIPT=${here}/verify.sh
+MONITOR_SCRIPT=${here}/monitor.sh
 
 SCHEMA_DB=
 MYSQL_DB=
@@ -75,6 +83,7 @@ CLI_EXTRA=(); SB_EXTRA=(); SB_EXTRA_STR=()
 if [[ -n "${SYSBENCH_ARGS:-}" ]]; then SB_EXTRA_STR+=("$SYSBENCH_ARGS"); read -r -a SB_EXTRA <<<"$SYSBENCH_ARGS"; fi
 MEMBERS=()
 SKIP_DDL=0; SKIP_LOAD=0; DO_VERIFY=0; WAIT_APPLIED=1; ALLOW_NONEMPTY=0
+MONITOR=0; MONITOR_INTERVAL_MS=1000; MONITOR_OUT_DIR=
 
 while [[ $# -gt 0 ]]; do
   # 同时接受 `--opt=value` 与 `--opt value`：把前者就地拆成两个位置参数，下面只写一种形态
@@ -107,6 +116,9 @@ while [[ $# -gt 0 ]]; do
     --verify) DO_VERIFY=1; shift;;
     --allow-nonempty) ALLOW_NONEMPTY=1; shift;;
     --no-wait-applied) WAIT_APPLIED=0; shift;;
+    --monitor) MONITOR=1; shift;;
+    --monitor-interval-ms) MONITOR_INTERVAL_MS=$2; shift 2;;
+    --monitor-out-dir) MONITOR_OUT_DIR=$2; shift 2;;
     *) echo "未知参数：$1（见文件头用法）" >&2; exit 2;;
   esac
 done
@@ -182,6 +194,29 @@ if [[ -z "$LEADER_PORT" ]]; then
   LEADER_PORT=$(leader_port_probe)
   [[ -n "$LEADER_PORT" ]] || { echo "没有成员报 LEADER（选举中？）——请稍后重试或显式给 --leader-port" >&2; exit 1; }
   echo "   Leader 端口：$LEADER_PORT"
+fi
+
+# ── --monitor：把自己重新放进 monitor.sh 里执行（只做一次，用 RAFT_MONITOR_WRAPPED 防递归）──
+if [[ $MONITOR -eq 1 && -z "${RAFT_MONITOR_WRAPPED:-}" ]]; then
+  [[ ${#MEMBERS[@]} -gt 0 ]] || { echo "--monitor 需要 --member（三台各一个，才能并排比较）" >&2; exit 2; }
+  m_args=(--sysbench="$SYSBENCH" --user="$LEADER_USER" --interval-ms="$MONITOR_INTERVAL_MS")
+  [[ -n "$LEADER_PASSWORD" ]] && m_args+=(--password="$LEADER_PASSWORD")
+  [[ -n "$MONITOR_OUT_DIR" ]] && m_args+=(--out-dir="$MONITOR_OUT_DIR")
+  m_args+=(--tag=prepare)
+  for m in "${MEMBERS[@]}"; do m_args+=(--member "$m"); done
+  forward=()
+  skip_next=0
+  for a in "${ORIG_ARGS[@]}"; do
+    if [[ $skip_next -eq 1 ]]; then skip_next=0; continue; fi
+    case "$a" in
+      --monitor) continue;;
+      --monitor-interval-ms) skip_next=1; continue;;
+      --monitor-out-dir) skip_next=1; continue;;
+      *) forward+=("$a");;
+    esac
+  done
+  echo "=== --monitor：交给 percona/monitor.sh 包住本次运行（间隔 ${MONITOR_INTERVAL_MS}ms）==="
+  exec env RAFT_MONITOR_WRAPPED=1 bash "$MONITOR_SCRIPT" "${m_args[@]}" -- "$0" ${forward[@]+"${forward[@]}"}
 fi
 
 echo "=== 0) 连接：Leader ${LEADER_HOST}:${LEADER_PORT}（用户 ${LEADER_USER}）、预演实例 ${PREVIEW_HOST}:${PREVIEW_PORT}（用户 ${PREVIEW_USER}）、成员 ${#MEMBERS[@]} 个 ==="

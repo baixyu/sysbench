@@ -246,6 +246,37 @@ $SB src/lua/raft_doctor.lua --mysql-host=127.0.0.1 --mysql-port=$LEADER \
 
 ---
 
+### 4.5 `raft_monitor.lua`：边跑边采 + 自动判读"慢在哪条腿"
+
+```bash
+# 采一段（默认 1s 一次；同名的 <out>.stop 文件出现即停，或用 --duration-s=N）
+$SB src/lua/raft_monitor.lua --mysql-host=127.0.0.1 --mysql-port=$LEADER --mysql-user=root \
+  --mysql-db=mysql sample --out=/tmp/m.tsv --interval-ms=1000
+# 抓一份 recent_events（给 summarize 算分阶段分布）
+$SB src/lua/raft_monitor.lua --mysql-host=127.0.0.1 --mysql-port=$LEADER --mysql-user=root \
+  --mysql-db=mysql ring --out=/tmp/m.ring.json
+# 汇总 + 判读（人看的报告，最后一行是机器可读的 raft_monitor.result）
+$SB src/lua/raft_monitor.lua --mysql-host=127.0.0.1 --mysql-port=$LEADER --mysql-user=root \
+  --mysql-db=mysql summarize --in-file=/tmp/m.tsv --ring-file=/tmp/m.ring.json
+```
+
+- **TSV 形状**：头一行 `#\traft_monitor.v1\thost=…\tport=…\tinterval_ms=…\tts_epoch\t<状态量名列…>`，
+  每行一个采样点；时间戳取**服务端时钟**（`UNIX_TIMESTAMP(NOW(6))`）⇒ 三个成员的样本可以直接对齐。
+- **采什么**（一次往返取回全部）：位点（commit / applier_progress / applying / local_durable /
+  durable_checkpoint / durable_quorum）、等待类（apply_barrier_entries、apply_dependency_waits、
+  write_permit_waits、caught_up_waits、admission_hold_timeouts）、结果未定（client_delivery_unknown 等 6 个）、
+  本机日志（journal_write_us / fsync_us / applied_batch_fsync_us / scan_us）、引擎 apply
+  （apply_count / apply_engine_us / slow_applies）、冻结与快照（freeze_* / binlog_freeze_deferrals /
+  wal_snapshot_copy_*）、捕获编码（captured_cache / envelope_sha256）、MySQL 侧旁证
+  （Threads_running / Innodb_data_fsyncs / Innodb_os_log_written / Queries）。**缺的状态量留空，不编 0**。
+- **判读（verdict）**按优先级给：`UNKNOWN_OUTCOMES`（客户端拿到 3197 ⇒ 反查那几笔的 local_apply）、
+  `COMMIT_GATE_QUEUE`、`APPLY_DEPENDENCY_WAIT`、`APPLIER_LAG`、`DURABLE_LAG`、`QUORUM_LAG`（**只在 leader 上判**）、
+  `PERMIT_QUEUE`、`POST_COMMIT_WAIT`（ring 里 `proposal→local_apply` 空档）、`COMMIT_STALLED`（只在窗口内确实
+  提交过时判）；无异常则 `NOTHING_SEEN` 并给出下一步。快照拷贝/回收推迟属于"提示项"，不算判据。
+- `--mysql-db` 随便给一个存在的库即可（采样不碰业务库；驱动默认 `sbtest`，不存在的库会连不上）。
+
+---
+
 ## 5. 包装脚本（`percona/*.sh`）
 
 ```bash
@@ -274,6 +305,25 @@ bash percona/raft_schema.sh --sysbench=$SB --schema-db=perf --schema-tables=t,t2
   --leader-host=127.0.0.1 --leader-port=$LEADER --leader-user=root \
   --member 127.0.0.1:43701 --member 127.0.0.1:43702 --member 127.0.0.1:43703 --wait-applied
 ```
+
+**边跑边采 + 自动判读：`percona/monitor.sh`**（把任意一条命令包起来，三台同时采，结束自动汇总）
+
+```bash
+bash percona/monitor.sh --sysbench=$SB \
+  --member 10.188.62.79:6606 --member 10.214.38.209:6606 --member 10.188.48.140:6606 \
+  --user=root --password='root' --interval-ms=1000 --out-dir=/tmp/raft-mon --tag=load \
+  -- bash percona/prepare.sh --sysbench=$SB --schema-db=test --mysql-db=test ...
+```
+
+- `--` 之后是要包住的命令（`prepare.sh`、原生 sysbench 负载、任何命令都行）；**退出码 = 被包命令的退出码**。
+- 产物：`<out-dir>/<tag>-<port>.tsv`（原始采样）、`.ring.json`、`.summary.txt`（逐台完整判读）、
+  `command.log`（被包命令原样输出）；屏幕上给"三台并排"的 `raft_monitor.result` 行 + 逐台判读。
+- 看什么：`post_commit_gap_p95_us`（提交完成→本机 apply 的空档）、`max_apply_lag` / `max_durable_lag`
+  （本机游标落后 commit 的峰值）、`max_quorum_lag`（leader 侧）、`unknown_delta`（结果未定）。
+  三台并排时，**谁的 lag 大就是那条腿**。
+
+`prepare.sh` 接了同一套：加 `--monitor`（可配 `--monitor-interval-ms=`、`--monitor-out-dir=`）就会自动用
+`monitor.sh` 把整条流程包住，不必手写 wrapper。
 
 **合并「建表 + 灌数」：`percona/prepare.sh`**（缺的表逐张走 transition，随后灌数 + 行长回读）。
 
