@@ -164,6 +164,20 @@ local function cmd_sample()
    if interval < 1 then interval = 1 end
    local duration = tonumber(sysbench.opt.duration_s) or 0
 
+   -- 防串台：目标文件已存在、且头里记的 host/port 与本机不同 ⇒ 拒绝。
+   -- （实测踩过：三台都用 6606 端口，wrapper 按"端口"命名 ⇒ 三个采样进程写同一个文件，
+   --  两份数据交错、表头被覆盖，最后 summarize 直接解析不出来。）
+   local pre = io.open(sysbench.opt.out, "r")
+   if pre ~= nil then
+      local first = pre:read("*l") or ""
+      pre:close()
+      local eh, ep = first:match("host=([^\t]+)"), first:match("port=([^\t]+)")
+      if eh ~= nil and (eh ~= host or tostring(ep) ~= port) then
+         die("目标文件 %s 已经是另一台写的（host=%s port=%s；本机 host=%s port=%s）：换 --out，或先删掉那个文件",
+             sysbench.opt.out, eh, tostring(ep), host, port)
+      end
+   end
+
    local names = {}
    for _, v in ipairs(VARS) do names[#names + 1] = v[1] end
    local fh, err = io.open(sysbench.opt.out, "w")
@@ -404,6 +418,9 @@ local function cmd_summarize()
          table.sort(gaps)
          print(string.format("  proposal→local_apply 空档: n=%d p50=%d p95=%d max=%d µs",
                              #gaps, pct(gaps, 50), pct(gaps, 95), gaps[#gaps]))
+      elseif by_stage["client_delivery"] == nil and by_stage["proposal"] == nil then
+         print("  注意：这份 ring 只有 apply 侧阶段（采样时本机是 follower）⇒ 看不到 proposal/client_delivery；")
+         print("        要定位\"提交完成→本机 apply\"那段空档，必须看 **leader** 的那一份 ring。")
       end
    end
 
@@ -485,8 +502,10 @@ local function cmd_summarize()
       if header[i]:match("^port=") then port = header[i]:sub(6) end
       end
    local cdelta = delta("Percona_raft_commit_index")
+   -- durable_quorum 是 leader 侧的量：follower 上恒 0，标成 n/a(follower) 免得被误读成"滞后"
+   local quorum_shown = is_leader and tostring(lq) or "n/a(follower)"
    print(string.format("\nraft_monitor.result host=%s port=%s samples=%d commit_delta=%s max_apply_lag=%s max_durable_lag=%s max_quorum_lag=%s post_commit_gap_p95_us=%s unknown_delta=%s verdicts=%d",
-                          host, port, n, tostring(cdelta), tostring(la), tostring(ld), tostring(lq),
+                          host, port, n, tostring(cdelta), tostring(la), tostring(ld), quorum_shown,
                           #gaps > 0 and tostring(pct(gaps, 95)) or "n/a",
                           tostring(delta("Percona_raft_client_delivery_unknown")), #verdicts))
 end

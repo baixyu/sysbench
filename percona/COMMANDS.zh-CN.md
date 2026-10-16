@@ -274,6 +274,11 @@ $SB src/lua/raft_monitor.lua --mysql-host=127.0.0.1 --mysql-port=$LEADER --mysql
   `PERMIT_QUEUE`、`POST_COMMIT_WAIT`（ring 里 `proposal→local_apply` 空档）、`COMMIT_STALLED`（只在窗口内确实
   提交过时判）；无异常则 `NOTHING_SEEN` 并给出下一步。快照拷贝/回收推迟属于"提示项"，不算判据。
 - `--mysql-db` 随便给一个存在的库即可（采样不碰业务库；驱动默认 `sbtest`，不存在的库会连不上）。
+- **ring 的内容随角色而变**：leader 的那份才有 `proposal` / `client_delivery` / `cache_capture` 等（因此
+  `proposal→local_apply` 空档只在 leader 上能算）；follower 的那份只有 apply 侧（`local_apply` /
+  `applied_sync` / `committed_sync`）。`summarize` 会在缺阶段时明确提示这一点。
+- `max_quorum_lag` 是 **leader 侧**的量（`durable_quorum_index` 在 follower 上恒为 0）⇒ 输出里 follower
+  标成 `n/a(follower)`，判据 `QUORUM_LAG` 也只在 leader 上生效。
 
 ---
 
@@ -316,8 +321,11 @@ bash percona/monitor.sh --sysbench=$SB \
 ```
 
 - `--` 之后是要包住的命令（`prepare.sh`、原生 sysbench 负载、任何命令都行）；**退出码 = 被包命令的退出码**。
-- 产物：`<out-dir>/<tag>-<port>.tsv`（原始采样）、`.ring.json`、`.summary.txt`（逐台完整判读）、
-  `command.log`（被包命令原样输出）；屏幕上给"三台并排"的 `raft_monitor.result` 行 + 逐台判读。
+- 产物（文件名**按 host_port 唯一**，因为三台常常用同一个端口）：`<out-dir>/<tag>-<host>_<port>.tsv`
+  （原始采样）、`.ring.json`、`.summary.txt`（逐台完整判读）、`.sample.log`、`command.log`（被包命令原样输出），
+  外加 **`<tag>-combined.txt`：三台并排 + 逐台完整汇总的合并报告（要发给别人，这一个文件就够）**。
+- `--print-full` 把合并报告也打到屏幕上（直接复制即可）。启动采样后 wrapper 会自检"每台文件都出现、
+  表头 host/port 与预期一致"，串台当场报错；`raft_monitor sample` 自己也会拒绝写进"已是另一台写的"文件。
 - 看什么：`post_commit_gap_p95_us`（提交完成→本机 apply 的空档）、`max_apply_lag` / `max_durable_lag`
   （本机游标落后 commit 的峰值）、`max_quorum_lag`（leader 侧）、`unknown_delta`（结果未定）。
   三台并排时，**谁的 lag 大就是那条腿**。
