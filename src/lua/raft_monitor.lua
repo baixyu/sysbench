@@ -44,6 +44,7 @@ local VARS = {
    {"Percona_raft_reconciliation_required", "s"}, {"Percona_raft_applier_ready", "s"},
    {"Percona_raft_term", "g"}, {"Percona_raft_leader_id", "g"}, {"Percona_raft_leader_generation", "c"},
    {"Percona_raft_voter_count", "g"}, {"Percona_raft_schema_epoch", "g"},
+   {"Percona_raft_local_raft_state", "s"},   -- 内含 is_leader/term/last_log/committed/durable/log_start
    -- 位点：commit 与四个"跟到哪儿"的游标
    {"Percona_raft_commit_index", "c"}, {"Percona_raft_committed_payload_index", "c"},
    {"Percona_raft_last_applied", "c"}, {"Percona_raft_applier_progress_index", "c"},
@@ -384,6 +385,7 @@ local function cmd_summarize()
       "Percona_raft_applier_applying_us", "Percona_raft_applier_slow_applies",
       "Percona_raft_freeze_deferred_by_lagging_member", "Percona_raft_binlog_freeze_deferrals",
       "Percona_raft_binlog_watermark_writes", "Percona_raft_wal_snapshot_copy_calls",
+      "Percona_raft_wal_snapshot_copy_bytes",
       "Percona_raft_durable_quorum_gate_failures",
       "Percona_raft_captured_cache_calls", "Percona_raft_envelope_sha256_calls",
       "Innodb_data_fsyncs", "Innodb_os_log_written",
@@ -398,6 +400,33 @@ local function cmd_summarize()
    end
 
    local cdelta = delta("Percona_raft_commit_index")
+   -- ②' 瞬时量：打印首/末/最大（非零才打）——留存条目数、peer_below_compacted_start 这类"状态"
+   -- 没有"增量"，只看增量会把它们全漏掉（实测踩过：journal_retained_records 一直没出现）。
+   local gauges = {
+      "Percona_raft_journal_retained_records", "Percona_raft_peer_below_compacted_start",
+      "Percona_raft_apply_max_in_flight", "Percona_raft_caught_up_real_lag",
+      "Percona_raft_freeze_live_member_floor", "Percona_raft_durable_quorum_members",
+      "Percona_raft_leader_generation", "Percona_raft_caught_up_max_lag",
+   }
+   local gl = {}
+   for _, nm in ipairs(gauges) do
+      local v = nums(nm)
+      if #v > 0 then
+         local mx = v[1]
+         for _, x in ipairs(v) do if x > mx then mx = x end end
+         if mx ~= 0 then gl[#gl + 1] = string.format("  %-46s 首=%s 末=%s 最大=%s", nm, tostring(v[1]), tostring(v[#v]), tostring(mx)) end
+      end
+   end
+   if #gl > 0 then
+      print("\n-- 瞬时量（首/末/最大）--")
+      for _, l in ipairs(gl) do print(l) end
+   end
+   if series["Percona_raft_local_raft_state"] then
+      print("\n-- local_raft_state（含 log_start / last_log / committed / durable）--")
+      print("  首: " .. (series["Percona_raft_local_raft_state"][1] or ""))
+      print("  末: " .. (series["Percona_raft_local_raft_state"][n] or ""))
+   end
+
    -- ③ ring：分阶段分布
    local gaps, deliveries = {}, {}
    if sysbench.opt.ring_file ~= "" then
@@ -428,6 +457,24 @@ local function cmd_summarize()
    print("\n=== 判读（verdict）===")
    local verdicts = {}
    local notes = {}
+   -- 日志扫描占了多少墙钟时间：这个比值高说明 applier 的时间被 txn store 的线性扫描吃掉了
+   -- （has_applied_record 是全量 find_if + 逐条比 envelope；read_unapplied_committed_* 还会拷 payload）
+   local scan_us, scan_calls = delta("Percona_raft_journal_scan_us"), delta("Percona_raft_journal_scan_calls")
+   if scan_us ~= nil and span > 0 then
+      local frac = scan_us / (span * 1e6)
+      local per_call = (scan_calls ~= nil and scan_calls > 0) and (scan_us / scan_calls) or nil
+      print(string.format("\n-- 日志扫描开销 --\n  journal_scan_us=%d（占本样本窗口墙钟 %.1f%%），调用 %s 次%s",
+                          scan_us, frac * 100, tostring(scan_calls),
+                          per_call and string.format("（≈%.1fms/次）", per_call / 1000) or ""))
+      if frac > 0.3 then
+         verdicts[#verdicts + 1] = string.format(
+            "JOURNAL_SCAN_DOMINANT：journal_scan 吃掉本窗口 %.0f%% 的墙钟（%s 次调用，≈%.1fms/次）" ..
+            " ⇒ txn store 的线性扫描/拷贝是主因，不是 commit gate、也不是磁盘 fsync。" ..
+            " 缓解方向：缩小条目（--batch 调小）、让留存条目变少（推进回收 / 修好留存最多的那台），" ..
+            "再看 --percona-raft-snapshot-reserved-log-items",
+            frac * 100, tostring(scan_calls), per_call and per_call / 1000 or 0)
+      end
+   end
    if delta("Percona_raft_client_delivery_unknown") and delta("Percona_raft_client_delivery_unknown") > 0 then
       verdicts[#verdicts + 1] = "UNKNOWN_OUTCOMES：采样期间出现「结果未定」的交付（客户端会拿到 3197），" ..
          "按 ring 里 client_delivery=UNKNOWN 的那几笔反查 local_apply 是否 SUCCESS（SUCCESS = 已落盘，别重灌）"
