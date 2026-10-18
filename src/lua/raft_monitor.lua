@@ -357,10 +357,16 @@ local function cmd_summarize()
                        tostring(num("Percona_raft_commit_index", 1)),
                        tostring(num("Percona_raft_commit_index", n))))
    if series["Percona_raft_state"] then
+      local ar = series["Percona_raft_applier_ready"]
       print(string.format("state: 首=%s 末=%s   serving 末=%s   applier_ready 末=%s",
                           series["Percona_raft_state"][1] or "", series["Percona_raft_state"][n] or "",
                           series["Percona_raft_serving"] and series["Percona_raft_serving"][n] or "?",
-                          series["Percona_raft_applier_ready"] and series["Percona_raft_applier_ready"][n] or "?"))
+                          ar and ar[n] or "?"))
+      -- applier_ready 是"该瞬间 applied == committed"（nuraft_adapter.h），是瞬时判断不是状态：
+      -- 末=OFF 只说明最后一个采样点差一点点，不代表没在 apply——要和 apply_lag 一起读。
+      if ar and ar[n] == "OFF" then
+         print("  注：applier_ready=OFF 表示最后一个采样点 applied 尚未追平 committed（见下方 apply 滞后峰值），不是"没在 apply"")
+      end
    end
 
    -- ① 三条"跟到哪儿"的滞后
