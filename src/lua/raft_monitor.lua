@@ -69,7 +69,9 @@ local VARS = {
    {"Percona_raft_journal_scan_us", "c"}, {"Percona_raft_journal_retained_records", "g"},
    -- 引擎 apply
    {"Percona_raft_applier_apply_count", "c"}, {"Percona_raft_applier_apply_engine_us", "c"},
-   {"Percona_raft_applier_applying_us", "c"}, {"Percona_raft_applier_slow_applies", "c"},
+   -- applying_us 是"当前这笔 apply 已经跑了多久，空闲时为 0"的瞬时量（raft_applier.h:
+   -- applying_microseconds()），不是累加器：当计数器算会出现"回退"，而且首末相减恒为 0。
+   {"Percona_raft_applier_applying_us", "g"}, {"Percona_raft_applier_slow_applies", "c"},
    -- 冻结 / binlog / 快照
    {"Percona_raft_freeze_deferred_by_lagging_member", "c"},
    {"Percona_raft_freeze_live_member_floor", "g"},
@@ -87,7 +89,11 @@ local VARS = {
 }
 
 local TYPE_OF = {}
-for _, v in ipairs(VARS) do TYPE_OF[v[1]] = v[2] end
+local IS_GAUGE = {}
+for _, v in ipairs(VARS) do
+   TYPE_OF[v[1]] = v[2]
+   if v[2] == "g" then IS_GAUGE[v[1]] = true end
+end
 
 local function connect()
    local drv = sysbench.sql.driver()
@@ -365,9 +371,38 @@ local function cmd_summarize()
    local function shown(v, at) return v == nil and "n/a（该状态量在这台机器上不存在）" or tostring(v) end
    print(string.format("  applier_progress : max=%s（第 %s 个样本）", shown(la), tostring(la_at)))
    print(string.format("  local_durable    : max=%s（第 %s 个样本）", shown(ld), tostring(ld_at)))
-   print(string.format("  durable_quorum   : max=%s（第 %s 个样本）", shown(lq), tostring(lq_at)))
+   -- durable_quorum_index 是 leader 侧的量：follower 上恒 0，直接算 commit-0 会打出接近
+   -- commit_index 的"滞后"，读起来像严重落后。这里按角色标 n/a，并说明它不是滞后。
+   local dq = series["Percona_raft_durable_quorum_index"]
+   local dq_flat_zero = dq ~= nil
+   if dq_flat_zero then
+      for i = 1, n do
+         if (dq[i] or 0) ~= 0 then dq_flat_zero = false; break end
+      end
+   end
+   if dq == nil then
+      print(string.format("  durable_quorum   : %s", shown(nil, nil)))
+   elseif dq_flat_zero then
+      print("  durable_quorum   : n/a（本机不是 leader：该项恒为 0，不是滞后）")
+   else
+      print(string.format("  durable_quorum   : max=%s（第 %s 个样本）", shown(lq), tostring(lq_at)))
+   end
 
    -- ② 等待/未定/冻结 类的增量
+   -- 瞬时量的峰值另列：applying_us 的 max 才是"最长一笔 apply 用了多久"
+   local au = series["Percona_raft_applier_applying_us"]
+   if au ~= nil then
+      local peak, at = 0, 0
+      for i = 1, n do
+         local v = au[i] or 0
+         if v > peak then peak, at = v, i end
+      end
+      if peak > 0 then
+         print(string.format("\n-- 瞬时峰值 --\n  applier_applying_us : max=%d µs（第 %d 个样本；应计入 apply 侧成本）",
+                             peak, at))
+      end
+   end
+
    print("\n-- 计数增量（首→末）--")
    local interesting = {
       "Percona_raft_apply_barrier_entries", "Percona_raft_apply_dependency_waits",
@@ -393,7 +428,9 @@ local function cmd_summarize()
    for _, nm in ipairs(interesting) do
       local d = delta(nm)
       local mv = monotonic_violations(nm)
-      if d ~= nil and (d ~= 0 or mv > 0) then
+      -- 瞬时量（g）本来就会上下走（例如 applying_us 空闲时归 0），既不能首末相减，也不能
+      -- 报"回退"。它们单独按峰值呈现。
+      if d ~= nil and not IS_GAUGE[nm] and (d ~= 0 or mv > 0) then
          local extra = mv > 0 and string.format("  [回退 %d 次！]", mv) or ""
          print(string.format("  %-52s %+d%s", nm, d, extra))
       end
