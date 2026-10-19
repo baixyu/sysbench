@@ -24,6 +24,13 @@ LUA=${here}/../src/lua/raft_monitor.lua
 USER=root
 PASSWORD=${MYSQL_PWD:-}
 INTERVAL_MS=1000
+RING_INTERVAL_MS=250
+HOST_METRICS=0
+HOST_INTERVAL_MS=1000
+NODE_EXPORTER_PORT=9100
+PROMETHEUS_URL=
+NODE_EXPORTER_URLS=()
+PROMETHEUS_INSTANCES=()
 OUT_DIR=
 TAG=mon
 PRINT_FULL=0
@@ -39,6 +46,14 @@ while [[ $# -gt 0 ]]; do
     --user) USER=$2; shift 2;;
     --password) PASSWORD=$2; shift 2;;
     --interval-ms) INTERVAL_MS=$2; shift 2;;
+    --ring-interval-ms) RING_INTERVAL_MS=$2; shift 2;;
+    --host-metrics) HOST_METRICS=1; shift;;
+    --no-host-metrics) HOST_METRICS=0; shift;;
+    --host-interval-ms) HOST_INTERVAL_MS=$2; shift 2;;
+    --node-exporter-port) NODE_EXPORTER_PORT=$2; shift 2;;
+    --node-exporter-url) NODE_EXPORTER_URLS+=("$2"); shift 2;;
+    --prometheus-url) PROMETHEUS_URL=$2; shift 2;;
+    --prometheus-instance) PROMETHEUS_INSTANCES+=("$2"); shift 2;;
     --out-dir) OUT_DIR=$2; shift 2;;
     --tag) TAG=$2; shift 2;;
     --print-full) PRINT_FULL=1; shift;;
@@ -72,15 +87,23 @@ for m in "${MEMBERS[@]}"; do
 done
 
 sampler_pids=()
+ring_pids=()
+host_pids=()
+host_files=()
 start_samplers() {
   local m host port tsv i=0
   for m in "${MEMBERS[@]}"; do
     host=${m%%:*}; port=${m##*:}; i=$((i + 1))
     tsv="$OUT_DIR/$(base_of "$m").tsv"
+    rm -f "$tsv.stop" "$OUT_DIR/$(base_of "$m").events.jsonl" "$OUT_DIR/$(base_of "$m").events.jsonl.stop"
     "$SYSBENCH" "$LUA" --mysql-host="$host" --mysql-port="$port" "${conn_args[@]}" \
       sample --out="$tsv" --interval-ms="$INTERVAL_MS" > "$OUT_DIR/$(base_of "$m").sample.log" 2>&1 &
     sampler_pids+=("$!")
-    echo "  [monitor] 采样启动：$host:$port → $tsv"
+    "$SYSBENCH" "$LUA" --mysql-host="$host" --mysql-port="$port" "${conn_args[@]}" \
+      ring-watch --out="$OUT_DIR/$(base_of "$m").events.jsonl" --interval-ms="$RING_INTERVAL_MS" \
+      > "$OUT_DIR/$(base_of "$m").ring-watch.log" 2>&1 &
+    ring_pids+=("$!")
+    echo "  [monitor] 采样启动：$host:$port → $tsv + events.jsonl"
   done
   # 自检：文件得出现，且头里的 host/port 必须就是这台（串台当场发现，别等跑完才发现）
   local m2 host2 port2 tsv2 hdr
@@ -92,40 +115,88 @@ start_samplers() {
       exit 2
     fi
     hdr=$(head -1 "$tsv2" | cut -f3,4)
-    if [[ "$hdr" != *"$host2"* && "$hdr" != *"$port2"* ]]; then
-      echo "  [monitor] 警告：$tsv2 的表头与 $host2:$port2 不匹配（$hdr）" >&2
+    if [[ "$hdr" != *"port=$port2"* || "$hdr" != *"host="* ]]; then
+      echo "  [monitor] 警告：$tsv2 的表头缺少目标端口或主机名（$hdr）" >&2
     fi
   done
 }
+start_host_monitors() {
+  [[ "$HOST_METRICS" -eq 1 ]] || return 0
+  command -v python3 >/dev/null 2>&1 || { echo "[monitor] --host-metrics 需要压测机上的 python3，主机指标未启动" >&2; return 0; }
+  [[ "$HOST_INTERVAL_MS" =~ ^[0-9]+$ && "$NODE_EXPORTER_PORT" =~ ^[0-9]+$ ]] || {
+    echo "[monitor] host interval/Node Exporter port 必须是整数，主机指标未启动" >&2; return 0;
+  }
+  local m host endpoint source instance map key file already
+  local seen_hosts=()
+  for m in "${MEMBERS[@]}"; do
+    host=${m%%:*}
+    already=0
+    for key in "${seen_hosts[@]}"; do [[ "$key" == "$host" ]] && already=1; done
+    [[ "$already" -eq 0 ]] || continue
+    seen_hosts+=("$host")
+    if [[ -n "$PROMETHEUS_URL" ]]; then
+      source=prometheus; endpoint=$PROMETHEUS_URL; instance="${host}:${NODE_EXPORTER_PORT}"
+      for map in "${PROMETHEUS_INSTANCES[@]}"; do
+        key=${map%%=*}; [[ "$key" == "$host" ]] && instance=${map#*=}
+      done
+    else
+      source=node-exporter; endpoint="http://${host}:${NODE_EXPORTER_PORT}"
+      for map in "${NODE_EXPORTER_URLS[@]}"; do
+        key=${map%%=*}; [[ "$key" == "$host" ]] && endpoint=${map#*=}
+      done
+    fi
+    file="$OUT_DIR/${TAG}-host-$(sanitize "$host").tsv"
+    rm -f "$file.stop"
+    host_files+=("$file")
+    local args=(--source "$source" --url "$endpoint" --out "$file" --interval-ms "$HOST_INTERVAL_MS")
+    [[ "$source" != prometheus ]] || args+=(--instance "$instance")
+    python3 "$here/host_monitor.py" "${args[@]}" > "$file.log" 2>&1 &
+    host_pids+=("$!")
+    echo "  [monitor] 主机指标启动：$host → $file ($source)"
+  done
+}
+
 stop_samplers() {
   local m tsv
   for m in "${MEMBERS[@]}"; do
     tsv="$OUT_DIR/$(base_of "$m").tsv"
     : > "$tsv.stop"
+    : > "$OUT_DIR/$(base_of "$m").events.jsonl.stop"
   done
+  local f
+  for f in "${host_files[@]:-}"; do : > "$f.stop"; done
   local pid
   for pid in "${sampler_pids[@]:-}"; do [[ -n "$pid" ]] && wait "$pid" 2>/dev/null; done
+  for pid in "${ring_pids[@]:-}"; do [[ -n "$pid" ]] && wait "$pid" 2>/dev/null; done
+  for pid in "${host_pids[@]:-}"; do [[ -n "$pid" ]] && wait "$pid" 2>/dev/null; done
   sampler_pids=()
+  ring_pids=()
+  host_pids=()
 }
 trap 'stop_samplers' EXIT
 
 echo "=== monitor：$(date +%T) 开始，输出目录 $OUT_DIR ==="
 start_samplers
+start_host_monitors
 sleep 1
 
 echo "=== 跑被包的命令：${CMD[*]} ==="
 set -o pipefail
-"${CMD[@]}" > >(tee "$OUT_DIR/command.log") 2>&1
-rc=$?
+"${CMD[@]}" 2>&1 | tee "$OUT_DIR/command.log" | while IFS= read -r line; do
+  printf '%s\n' "$line"
+  ts_now=$(date +%s)
+  if [[ "$line" == ===* ]]; then printf '%s\t%s\n' "$ts_now" "$line" >> "$OUT_DIR/phase-markers.tsv"; fi
+  if [[ "$line" == *tps:* && "$line" == *lat* ]]; then printf '%s\t%s\n' "$ts_now" "$line" >> "$OUT_DIR/client-intervals.tsv"; fi
+done
+rc=${PIPESTATUS[0]}
 echo "=== 命令结束（rc=${rc}），停止采样并汇总 ==="
 stop_samplers
 
 for m in "${MEMBERS[@]}"; do
   host=${m%%:*}; port=${m##*:}
   ts="$OUT_DIR/$(base_of "$m")"
-  "$SYSBENCH" "$LUA" --mysql-host="$host" --mysql-port="$port" "${conn_args[@]}" ring --out="$ts.ring.json" >/dev/null 2>&1 || echo "  [monitor] 警告：$host:$port 的 ring 抓取失败" >&2
   "$SYSBENCH" "$LUA" --mysql-host="$host" --mysql-port="$port" "${conn_args[@]}" summarize \
-    --in-file="$ts.tsv" --ring-file="$ts.ring.json" > "$ts.summary.txt" 2>&1 || echo "  [monitor] 警告：$host:$port 的汇总失败" >&2
+    --in-file="$ts.tsv" --ring-file="$ts.events.jsonl" > "$ts.summary.txt" 2>&1 || echo "  [monitor] 警告：$host:$port 的汇总失败" >&2
 done
 
 echo
@@ -147,12 +218,24 @@ COMBINED="$OUT_DIR/${TAG}-combined.txt"
 {
   echo "# raft monitor 合并报告  $(date '+%F %T')"
   echo "# 被包命令：${CMD[*]}"
+  echo "# 客户端区间输出：$OUT_DIR/client-intervals.tsv（需被包命令启用 sysbench --report-interval）"
+  echo "# 阶段标记：$OUT_DIR/phase-markers.tsv"
+  for m in "${MEMBERS[@]}"; do echo "# 采样文件：$OUT_DIR/$(base_of "$m").tsv；事件：$OUT_DIR/$(base_of "$m").events.jsonl"; done
+  for f in "${host_files[@]:-}"; do echo "# 主机指标：$f；日志：$f.log"; done
   echo
   echo "## 三台并排"
   for m in "${MEMBERS[@]}"; do
     grep -h "^raft_monitor.result" "$OUT_DIR/$(base_of "$m").summary.txt" 2>/dev/null || echo "raft_monitor.result member=$m （缺）"
   done
   echo
+  if [[ ${#host_files[@]} -gt 0 ]]; then
+    echo "## 主机指标窗口摘要"
+    for f in "${host_files[@]}"; do
+      echo "### $f"
+      awk -F '\t' 'NR > 1 && $3 != "" { n++; cpu += $3; if ($4 > iowait) iowait = $4; if (!have_mem || $5 < min_mem) { min_mem = $5; have_mem = 1 } if ($10 > disk_util) disk_util = $10; if ($11 > disk_await) disk_await = $11; drops += $15; retrans += $16 } END { if (!n) print "samples=0（尚无完整计数器区间；检查同名 .log）"; else printf "samples=%d cpu_busy_avg=%.2f%% iowait_max=%.2f%% memavailable_min=%.0f disk_util_max=%.2f%% disk_await_max=%.2fms net_drops_delta=%.0f tcp_retrans_delta=%.0f\n", n, cpu/n, iowait, min_mem, disk_util, disk_await, drops, retrans }' "$f"
+    done
+    echo
+  fi
   echo "## 逐台完整汇总"
   for m in "${MEMBERS[@]}"; do
     echo; echo "----- $m -----"

@@ -46,6 +46,12 @@
 #                           "慢在哪条腿"（apply 滞后/日志滞后/commit gate/许可/快照），报告落在 --monitor-out-dir
 #   --monitor-interval-ms=N 采样间隔（默认 1000）
 #   --monitor-out-dir=DIR   报告目录（默认 /tmp/raft-mon.<时间戳>）
+#   --monitor-ring-interval-ms=N  recent_events 轮询间隔（默认 250）
+#   --monitor-host-metrics      从压测机通过 HTTP 采 Node Exporter/Prometheus 主机指标（默认关闭）
+#   --monitor-prometheus-url=U  Prometheus HTTP 地址；未给时直连节点 :9100/metrics
+#   --monitor-node-exporter-port=N  Node Exporter 端口（默认 9100）
+#   --monitor-node-exporter-url=HOST=URL  覆盖对应节点的 exporter 根地址（可重复）
+#   --monitor-prometheus-instance=HOST=INSTANCE  覆盖 Prometheus instance 标签（可重复）
 #   --allow-nonempty        允许对非空表灌数（默认拒绝）
 #   --no-wait-applied       提案后不等本机应用完成（默认等待）
 #
@@ -83,7 +89,9 @@ CLI_EXTRA=(); SB_EXTRA=(); SB_EXTRA_STR=()
 if [[ -n "${SYSBENCH_ARGS:-}" ]]; then SB_EXTRA_STR+=("$SYSBENCH_ARGS"); read -r -a SB_EXTRA <<<"$SYSBENCH_ARGS"; fi
 MEMBERS=()
 SKIP_DDL=0; SKIP_LOAD=0; DO_VERIFY=0; WAIT_APPLIED=1; ALLOW_NONEMPTY=0
-MONITOR=0; MONITOR_INTERVAL_MS=1000; MONITOR_OUT_DIR=
+MONITOR=0; MONITOR_INTERVAL_MS=1000; MONITOR_RING_INTERVAL_MS=250; MONITOR_OUT_DIR=
+MONITOR_HOST_METRICS=0; MONITOR_HOST_INTERVAL_MS=1000; MONITOR_NODE_EXPORTER_PORT=9100; MONITOR_PROMETHEUS_URL=
+MONITOR_NODE_EXPORTER_URLS=(); MONITOR_PROMETHEUS_INSTANCES=()
 
 while [[ $# -gt 0 ]]; do
   # 同时接受 `--opt=value` 与 `--opt value`：把前者就地拆成两个位置参数，下面只写一种形态
@@ -118,6 +126,14 @@ while [[ $# -gt 0 ]]; do
     --no-wait-applied) WAIT_APPLIED=0; shift;;
     --monitor) MONITOR=1; shift;;
     --monitor-interval-ms) MONITOR_INTERVAL_MS=$2; shift 2;;
+    --monitor-ring-interval-ms) MONITOR_RING_INTERVAL_MS=$2; shift 2;;
+    --monitor-host-metrics) MONITOR_HOST_METRICS=1; shift;;
+    --no-monitor-host-metrics) MONITOR_HOST_METRICS=0; shift;;
+    --monitor-host-interval-ms) MONITOR_HOST_INTERVAL_MS=$2; shift 2;;
+    --monitor-node-exporter-port) MONITOR_NODE_EXPORTER_PORT=$2; shift 2;;
+    --monitor-node-exporter-url) MONITOR_NODE_EXPORTER_URLS+=("$2"); shift 2;;
+    --monitor-prometheus-url) MONITOR_PROMETHEUS_URL=$2; shift 2;;
+    --monitor-prometheus-instance) MONITOR_PROMETHEUS_INSTANCES+=("$2"); shift 2;;
     --monitor-out-dir) MONITOR_OUT_DIR=$2; shift 2;;
     *) echo "未知参数：$1（见文件头用法）" >&2; exit 2;;
   esac
@@ -199,9 +215,14 @@ fi
 # ── --monitor：把自己重新放进 monitor.sh 里执行（只做一次，用 RAFT_MONITOR_WRAPPED 防递归）──
 if [[ $MONITOR -eq 1 && -z "${RAFT_MONITOR_WRAPPED:-}" ]]; then
   [[ ${#MEMBERS[@]} -gt 0 ]] || { echo "--monitor 需要 --member（三台各一个，才能并排比较）" >&2; exit 2; }
-  m_args=(--sysbench="$SYSBENCH" --user="$LEADER_USER" --interval-ms="$MONITOR_INTERVAL_MS")
+  m_args=(--sysbench="$SYSBENCH" --user="$LEADER_USER" --interval-ms="$MONITOR_INTERVAL_MS" --ring-interval-ms="$MONITOR_RING_INTERVAL_MS")
   [[ -n "$LEADER_PASSWORD" ]] && m_args+=(--password="$LEADER_PASSWORD")
   [[ -n "$MONITOR_OUT_DIR" ]] && m_args+=(--out-dir="$MONITOR_OUT_DIR")
+  [[ "$MONITOR_HOST_METRICS" -eq 1 ]] && m_args+=(--host-metrics --host-interval-ms="$MONITOR_HOST_INTERVAL_MS")
+  m_args+=(--node-exporter-port="$MONITOR_NODE_EXPORTER_PORT")
+  [[ -n "$MONITOR_PROMETHEUS_URL" ]] && m_args+=(--prometheus-url="$MONITOR_PROMETHEUS_URL")
+  for a in "${MONITOR_NODE_EXPORTER_URLS[@]}"; do m_args+=(--node-exporter-url "$a"); done
+  for a in "${MONITOR_PROMETHEUS_INSTANCES[@]}"; do m_args+=(--prometheus-instance "$a"); done
   m_args+=(--tag=prepare)
   for m in "${MEMBERS[@]}"; do m_args+=(--member "$m"); done
   forward=()
@@ -211,6 +232,10 @@ if [[ $MONITOR -eq 1 && -z "${RAFT_MONITOR_WRAPPED:-}" ]]; then
     case "$a" in
       --monitor) continue;;
       --monitor-interval-ms) skip_next=1; continue;;
+      --monitor-ring-interval-ms) skip_next=1; continue;;
+      --monitor-host-metrics|--no-monitor-host-metrics) continue;;
+      --monitor-host-interval-ms|--monitor-node-exporter-port|--monitor-prometheus-url) skip_next=1; continue;;
+      --monitor-node-exporter-url|--monitor-prometheus-instance) skip_next=1; continue;;
       --monitor-out-dir) skip_next=1; continue;;
       *) forward+=("$a");;
     esac

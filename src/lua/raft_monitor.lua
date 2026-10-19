@@ -10,6 +10,7 @@
 -- 命令：
 --   sample     按间隔把状态量追加到 TSV（同名的 <out>.stop 文件出现即停；--duration-s 也可停）
 --   ring       把 PERCONA_RAFT_RECENT_EVENTS() 的 JSON 落到文件（供 summarize 算分阶段分布）
+--   ring-watch 压测期间持续轮询有界事件环，追加去重事件到 JSONL
 --   summarize  读 TSV（可带 ring JSON），打印汇总 + 判读（verdict）
 --
 -- 用法（一般用 percona/monitor.sh 包住一条命令，不用手写这三个命令）：
@@ -21,13 +22,13 @@
 --
 
 if sysbench.cmdline.command == nil then
-   error("命令必填：sample | ring | summarize（见文件头注释）", 0)
+   error("命令必填：sample | ring | ring-watch | summarize（见文件头注释）", 0)
 end
 
 sysbench.cmdline.options = {
    out = {"sample：TSV 输出路径（同名 .stop 文件 = 停止开关）；ring：JSON 输出路径", ""},
    in_file = {"summarize：要分析的 TSV", ""},
-   ring_file = {"summarize：可选的 ring JSON（raft_monitor ring 的输出）", ""},
+   ring_file = {"summarize：可选的 recent_events JSON/JSONL 文件", ""},
    interval_ms = {"sample：采样间隔（毫秒）", 1000},
    duration_s = {"sample：最长采样秒数（0 = 采到 <out>.stop 出现）", 0},
    lag_warn = {"summarize：apply 滞后告警阈值（条目数）", 200},
@@ -77,6 +78,18 @@ local VARS = {
    {"Percona_raft_freeze_live_member_floor", "g"},
    {"Percona_raft_binlog_freeze_deferrals", "c"}, {"Percona_raft_binlog_watermark_writes", "c"},
    {"Percona_raft_binlog_derived_writes", "c"}, {"Percona_raft_binlog_derivation_prefix_losses", "c"},
+   {"Percona_raft_admission_success", "c"},
+   {"Percona_raft_wal_append_batches", "c"}, {"Percona_raft_wal_append_records", "c"},
+   {"Percona_raft_binlog_derived_through_index", "g"},
+   {"Percona_raft_binlog_derived_syncs", "c"}, {"Percona_raft_binlog_backfilled_entries", "c"},
+   {"Percona_raft_binlog_backfill_active", "g"}, {"Percona_raft_binlog_backfill_from_index", "g"},
+   {"Percona_raft_binlog_backfill_through_index", "g"},
+   {"Percona_raft_binlog_backfill_scanned_entries", "c"},
+   {"Percona_raft_binlog_backfill_scanned_bytes", "c"},
+   {"Percona_raft_binlog_backfill_max_batch_bytes", "g"},
+   {"Percona_raft_binlog_backfill_last_duration_us", "g"},
+   {"Percona_raft_binlog_derivation_failures", "c"},
+   {"Percona_raft_binlog_derivation_paused", "g"},
    {"Percona_raft_wal_snapshot_copy_calls", "c"}, {"Percona_raft_wal_snapshot_copy_bytes", "c"},
    {"Percona_raft_peer_below_compacted_start", "g"},
    -- 捕获/编码（本机成本）
@@ -85,6 +98,11 @@ local VARS = {
    {"Percona_raft_metadata_statements_applied", "c"}, {"Percona_raft_metadata_statements_failed", "c"},
    -- MySQL 侧旁证
    {"Threads_running", "g"}, {"Innodb_data_fsyncs", "c"}, {"Innodb_os_log_written", "c"},
+   {"Innodb_log_waits", "c"}, {"Innodb_buffer_pool_read_requests", "c"},
+   {"Innodb_buffer_pool_reads", "c"}, {"Innodb_buffer_pool_pages_dirty", "g"},
+   {"Innodb_buffer_pool_pages_data", "g"}, {"Innodb_rows_inserted", "c"},
+   {"Innodb_rows_updated", "c"}, {"Innodb_rows_deleted", "c"}, {"Innodb_rows_read", "c"},
+   {"Innodb_data_read", "c"}, {"Innodb_data_written", "c"},
    {"Queries", "c"},
 }
 
@@ -100,25 +118,20 @@ local function connect()
    return drv:connect()
 end
 
-local function server_ts(con)
-   local v = con:query_row("SELECT UNIX_TIMESTAMP(NOW(6))")
-   return v and tostring(v) or "0"
-end
-
 -- 一个采样点：一次往返取回全部状态量（performance_schema.global_status）
 local function sample_once(con)
-   local ts = server_ts(con)
    local names = {}
    for _, v in ipairs(VARS) do names[#names + 1] = "'" .. v[1] .. "'" end
    local rs = con:query(
-      "SELECT VARIABLE_NAME, VARIABLE_VALUE FROM performance_schema.global_status "
-      .. "WHERE VARIABLE_NAME IN (" .. table.concat(names, ",") .. ")")
-   local m = {}
+      "SELECT VARIABLE_NAME, VARIABLE_VALUE, UNIX_TIMESTAMP(NOW(6)) "
+      .. "FROM performance_schema.global_status WHERE VARIABLE_NAME IN (" .. table.concat(names, ",") .. ")")
+   local m, ts = {}, "0"
    local row
    while true do
       row = rs:fetch_row()
       if row == nil then break end
       m[row[1]] = tostring(row[2] or "")
+      ts = tostring(row[3] or ts)
    end
    rs:free()
    local cells = { ts }
@@ -214,13 +227,66 @@ end
 --
 -- ring
 --
+local parse_ring -- ring-watch 在定义时前向引用
+
+local function ring_snapshot(con)
+   local s = con:query_row("SELECT PERCONA_RAFT_RECENT_EVENTS()")
+   return s and tostring(s) or "[]"
+end
+
 local function cmd_ring()
    if sysbench.opt.out == "" then die("ring 需要 --out=<JSON 路径>") end
-   local con = connect()
-   local s = con:query_row("SELECT PERCONA_RAFT_RECENT_EVENTS()")
-   s = s and tostring(s) or "[]"
+   local s = ring_snapshot(connect())
    write_file(sysbench.opt.out, s .. "\n")
    print(string.format("raft_monitor.ring_bytes=%d out=%s", #s, sysbench.opt.out))
+end
+
+-- recent_events 是有界环形缓冲区。采样期间持续轮询，把新事件追加为 JSONL，避免只拿到
+-- 压测结束时最近的 256 条。启动时先做基线，不把压测前事件计入本次结果。
+local function cmd_ring_watch()
+   if sysbench.opt.out == "" then die("ring-watch 需要 --out=<JSONL 路径>") end
+   local con, seen = connect(), {}
+   local interval = math.max(tonumber(sysbench.opt.interval_ms) or 1000, 50)
+   local stop_path = sysbench.opt.out .. ".stop"
+   local function identity(e)
+      return table.concat({e.cluster_txn_id or "", e.stage or "", e.outcome or "", e.reason or "",
+                           e.start_us or "", e.end_us or ""}, "|")
+   end
+   local function remember(snapshot, fh)
+      for _, e in ipairs(parse_ring(snapshot)) do
+         local id = identity(e)
+         if not seen[id] then
+            seen[id] = true
+            if fh then
+               local fields = {"cluster_txn_id", "stage", "outcome", "reason", "node_id", "term", "log_index",
+                               "leader_generation", "duration_us", "start_us", "end_us"}
+               local out = {}
+               for _, k in ipairs(fields) do
+                  local v = e[k]
+                  if v ~= nil then
+                     v = tostring(v):gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\n", "\\n")
+                     out[#out + 1] = string.format('"%s":"%s"', k, v)
+                  end
+               end
+               fh:write("{" .. table.concat(out, ",") .. "}\n")
+            end
+         end
+      end
+      if fh then fh:flush() end
+   end
+   remember(ring_snapshot(con), nil) -- 压测前基线
+   local fh, err = io.open(sysbench.opt.out, "w")
+   if fh == nil then die("写不了 %s：%s", sysbench.opt.out, tostring(err)) end
+   local count = 0
+   while true do
+      pcall(function() remember(ring_snapshot(con), fh) end)
+      count = count + 1
+      local f = io.open(stop_path, "r")
+      if f then f:close(); break end
+      pcall(function() con:query_row(string.format("SELECT SLEEP(%.3f)", interval / 1000)) end)
+   end
+   fh:close()
+   print(string.format("raft_monitor.ring_polls=%d out=%s", count, sysbench.opt.out))
 end
 
 --
@@ -228,13 +294,47 @@ end
 --
 
 -- 极简 ring 解析：它是 [{ "k":v, ... }, ...]，值都是标量（没有嵌套），所以按 "},{" 切开逐个取键值。
-local function parse_ring(text)
+parse_ring = function(text)
    local events = {}
+   local function quoted(s, pos)
+      if s:sub(pos, pos) ~= '"' then return nil, pos end
+      local out, i = {}, pos + 1
+      while i <= #s do
+         local c = s:sub(i, i)
+         if c == '"' then return table.concat(out), i + 1 end
+         if c == "\\" and i < #s then
+            i = i + 1
+            local esc = s:sub(i, i)
+            local map = {n="\n", r="\r", t="\t", ['"']='"', ['\\']='\\', ['/']="/"}
+            out[#out + 1] = map[esc] or esc
+         else
+            out[#out + 1] = c
+         end
+         i = i + 1
+      end
+      return table.concat(out), i
+   end
    for obj in text:gmatch("{([^{}]*)}") do
-      local e = {}
-      for k, v in obj:gmatch('"([%w_]+)"%s*:%s*("?[^,]+"?)') do
-         v = v:gsub('^"', ''):gsub('"$', '')
-         if v ~= "null" then e[k] = v end
+      local e, pos = {}, 1
+      while pos <= #obj do
+         while pos <= #obj and (obj:sub(pos, pos):match("[%s,]") ~= nil) do pos = pos + 1 end
+         if pos > #obj then break end
+         local key
+         key, pos = quoted(obj, pos)
+         if key == nil then break end
+         while obj:sub(pos, pos):match("%s") do pos = pos + 1 end
+         if obj:sub(pos, pos) ~= ":" then break end
+         pos = pos + 1
+         while obj:sub(pos, pos):match("%s") do pos = pos + 1 end
+         local value
+         if obj:sub(pos, pos) == '"' then
+            value, pos = quoted(obj, pos)
+         else
+            local stop = obj:find(",", pos, true) or (#obj + 1)
+            value = obj:sub(pos, stop - 1):match("^%s*(.-)%s*$")
+            pos = stop
+         end
+         if value ~= nil and value ~= "null" then e[key] = value end
       end
       if e.stage ~= nil then events[#events + 1] = e end
    end
@@ -250,17 +350,22 @@ local function pct(sorted, p)
 end
 
 local function stage_stats(events)
-   local by_stage, txn = {}, {}
+   local by_stage, txn, seen = {}, {}, {}
    for _, e in ipairs(events) do
-      local d = tonumber(e.duration_us)
-      if d ~= nil then
-         by_stage[e.stage] = by_stage[e.stage] or {}
-         table.insert(by_stage[e.stage], d)
-      end
-      local id = e.cluster_txn_id
-      if id ~= nil then
-         txn[id] = txn[id] or {}
-         txn[id][e.stage] = e
+      local key = table.concat({e.cluster_txn_id or "", e.stage or "", e.outcome or "", e.reason or "",
+                                e.start_us or "", e.end_us or ""}, "|")
+      if not seen[key] then
+         seen[key] = true
+         local d = tonumber(e.duration_us)
+         if d ~= nil then
+            by_stage[e.stage] = by_stage[e.stage] or {}
+            table.insert(by_stage[e.stage], d)
+         end
+         local id = e.cluster_txn_id
+         if id ~= nil then
+            txn[id] = txn[id] or {}
+            txn[id][e.stage] = e
+         end
       end
    end
    -- proposal 结束 → local_apply 开始 的空档（"提交后等本机 apply"）
@@ -425,11 +530,17 @@ local function cmd_summarize()
       "Percona_raft_applier_apply_count", "Percona_raft_applier_apply_engine_us",
       "Percona_raft_applier_applying_us", "Percona_raft_applier_slow_applies",
       "Percona_raft_freeze_deferred_by_lagging_member", "Percona_raft_binlog_freeze_deferrals",
-      "Percona_raft_binlog_watermark_writes", "Percona_raft_wal_snapshot_copy_calls",
-      "Percona_raft_wal_snapshot_copy_bytes",
+      "Percona_raft_binlog_watermark_writes", "Percona_raft_binlog_derived_writes",
+      "Percona_raft_binlog_derived_syncs", "Percona_raft_binlog_backfilled_entries",
+      "Percona_raft_binlog_backfill_scanned_entries", "Percona_raft_binlog_backfill_scanned_bytes",
+      "Percona_raft_binlog_derivation_prefix_losses", "Percona_raft_binlog_derivation_failures",
+      "Percona_raft_wal_append_batches", "Percona_raft_wal_append_records", "Percona_raft_admission_success",
+      "Percona_raft_wal_snapshot_copy_calls", "Percona_raft_wal_snapshot_copy_bytes",
       "Percona_raft_durable_quorum_gate_failures",
       "Percona_raft_captured_cache_calls", "Percona_raft_envelope_sha256_calls",
-      "Innodb_data_fsyncs", "Innodb_os_log_written",
+      "Innodb_data_fsyncs", "Innodb_os_log_written", "Innodb_log_waits",
+      "Innodb_rows_inserted", "Innodb_rows_updated", "Innodb_rows_deleted", "Innodb_rows_read",
+      "Innodb_data_read", "Innodb_data_written",
    }
    for _, nm in ipairs(interesting) do
       local d = delta(nm)
@@ -442,6 +553,32 @@ local function cmd_summarize()
       end
    end
 
+   -- 按窗口秒数归一化，方便和 sysbench 的 report-interval 对齐比较。
+   if span > 0 then
+      local rate_names = {
+         {"Queries", "queries/s"}, {"Percona_raft_wal_append_records", "WAL records/s"},
+         {"Percona_raft_wal_append_batches", "WAL batches/s"}, {"Innodb_rows_inserted", "InnoDB inserts/s"},
+         {"Innodb_rows_updated", "InnoDB updates/s"}, {"Innodb_rows_deleted", "InnoDB deletes/s"},
+         {"Innodb_rows_read", "InnoDB rows read/s"}, {"Innodb_data_read", "InnoDB bytes read/s"},
+         {"Innodb_data_written", "InnoDB bytes written/s"}, {"Innodb_data_fsyncs", "InnoDB fsync/s"},
+      }
+      local shown_rates = {}
+      for _, item in ipairs(rate_names) do
+         local d = delta(item[1])
+         if d ~= nil then shown_rates[#shown_rates + 1] = string.format("%s=%.1f", item[2], d / span) end
+      end
+      local records, batches = delta("Percona_raft_wal_append_records"), delta("Percona_raft_wal_append_batches")
+      if records and batches and batches > 0 then
+         shown_rates[#shown_rates + 1] = string.format("WAL records/batch=%.2f", records / batches)
+      end
+      local requests, reads = delta("Innodb_buffer_pool_read_requests"), delta("Innodb_buffer_pool_reads")
+      if requests and reads and requests > 0 then
+         local hit = math.max(0, math.min(100, 100 * (1 - reads / requests)))
+         shown_rates[#shown_rates + 1] = string.format("buffer-pool hit=%.2f%%", hit)
+      end
+      if #shown_rates > 0 then print("\n-- 窗口速率（首末计数差 / 采样秒数）--\n  " .. table.concat(shown_rates, "  ")) end
+   end
+
    local cdelta = delta("Percona_raft_commit_index")
    -- ②' 瞬时量：打印首/末/最大（非零才打）——留存条目数、peer_below_compacted_start 这类"状态"
    -- 没有"增量"，只看增量会把它们全漏掉（实测踩过：journal_retained_records 一直没出现）。
@@ -450,6 +587,11 @@ local function cmd_summarize()
       "Percona_raft_apply_max_in_flight", "Percona_raft_caught_up_real_lag",
       "Percona_raft_freeze_live_member_floor", "Percona_raft_durable_quorum_members",
       "Percona_raft_leader_generation", "Percona_raft_caught_up_max_lag",
+      "Innodb_buffer_pool_pages_dirty", "Innodb_buffer_pool_pages_data",
+      "Percona_raft_binlog_derived_through_index", "Percona_raft_binlog_backfill_active",
+      "Percona_raft_binlog_backfill_from_index", "Percona_raft_binlog_backfill_through_index",
+      "Percona_raft_binlog_backfill_max_batch_bytes", "Percona_raft_binlog_backfill_last_duration_us",
+      "Percona_raft_binlog_derivation_paused",
    }
    local gl = {}
    for _, nm in ipairs(gauges) do
@@ -605,6 +747,7 @@ end
 sysbench.cmdline.commands = {
    sample = {cmd_sample},
    ring = {cmd_ring},
+   ["ring-watch"] = {cmd_ring_watch},
    summarize = {cmd_summarize},
 }
 
