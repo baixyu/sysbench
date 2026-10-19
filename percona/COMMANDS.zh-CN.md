@@ -24,8 +24,8 @@ LEADER=$PORT
 2. **两个库名参数**：`--mysql-db`（连哪个库，sysbench 默认 `sbtest`）必须与 `--schema-db`（DDL/DML 里的库名）
    给**同一个值**，否则直接 `Unknown database 'sbtest'`。
 3. **库必须提前建好**：本工具**不建库**（`raft_prepare.lua` 只发 `CREATE TABLE`）。受管 DDL 也不允许
-   `CREATE DATABASE`（服务端把它归为"未复制的元数据语句"而拒绝，且 transition 只能带
-   `ALTER TABLE` / `CREATE TABLE` / `RENAME TABLE` / `DROP TABLE`）⇒ 库要在 **Raft 关闭时**每个成员各建一次
+   `CREATE DATABASE`（服务端把它归为"未复制的元数据语句"而拒绝，且 transition 只接受
+   `ALTER TABLE` / `CREATE TABLE` / `RENAME TABLE` / `DROP TABLE` / `TRUNCATE TABLE`）⇒ 库要在 **Raft 关闭时**每个成员各建一次
    （见 §3）。只有 `raft_doctor.lua` 例外，它自建自己的 `perf_doctor_golden`。
 4. **`--target` 三档**：`raft`（受管集群；探不到身份变量就 FATAL，故意不静默降级）、`mysql`（原生 MySQL）、
    `auto`（默认）。对原生实例用 `raft` 一定失败，这是设计。
@@ -303,7 +303,7 @@ bash percona/doctor.sh --sysbench=$SB \
   --preview-host=127.0.0.1 --preview-port=43704 --preview-user=root \
   --require-raft --golden-dir=./schemas/golden
 
-# 活集群加/改表（预演实例派生目标 manifest → 提案 → 三台核对）
+# 活集群加/改表（预演实例提供独立期望指纹 → 单参数 DDL 提案 → 三台核对）
 bash percona/raft_schema.sh --sysbench=$SB --schema-db=perf --schema-tables=t,t2 \
   --ddl="CREATE TABLE perf.t2 (id INT PRIMARY KEY, v INT NOT NULL)" \
   --preview-host=127.0.0.1 --preview-port=43704 --preview-user=root \
@@ -450,27 +450,27 @@ run oltp_insert.lua
 
 ---
 
-## 7. schema transition（往活集群加表）
+## 7. schema transition（往活集群加、改或清空表）
+
+单参数接口由服务端从 DDL 推导目标 manifest；操作员不用先生成或传入 manifest：
 
 ```bash
-# ① 预演实例（Raft 关闭、与集群同一份 schema）上把目标表建出来
-$MYSQL -h127.0.0.1 -P43704 -uroot perf -e \
-  "CREATE TABLE perf.t2 (id INT PRIMARY KEY, v INT NOT NULL)"
-# ② 派生目标 manifest：函数是**两参**（库, 表清单），返回的是 JSON，不是裸十六进制
-JSON=$($MYSQL -h127.0.0.1 -P43704 -uroot -Nse \
-  "SELECT PERCONA_RAFT_SCHEMA_MANIFEST('perf','t,t2')")
-HEX=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['manifest_hex'])" "$JSON")
-#    同一个 JSON 里还有 fingerprint（＝目标指纹，提案时用 --expect-fingerprint 对账）
-# ③ 对 leader 提案
 $MYSQL -h127.0.0.1 -P$LEADER -uroot perf -e \
-  "SELECT PERCONA_RAFT_SCHEMA_TRANSITION('CREATE TABLE perf.t2 (id INT PRIMARY KEY, v INT NOT NULL)', '$HEX') AS transition_result\G"
-# ④ 三台核对：schema_epoch 都 +1、目标表存在、每台自派生指纹一致
-for p in 43701 43702 43703; do $MYSQL -h127.0.0.1 -P$p -uroot -Nse \
-  "SHOW STATUS LIKE 'Percona_raft_schema_epoch'"; done
+  "SELECT PERCONA_RAFT_SCHEMA_TRANSITION('CREATE TABLE perf.t2 (id INT PRIMARY KEY, v INT NOT NULL)') AS transition_result\G"
 ```
 
-或用 §5 的 `percona/raft_schema.sh` 一条命令（含"预演实例与集群在 force 的指纹必须先相同"的预检；
-`--schema-tables` 是**目标**清单，新增表必须与 DDL 同名）。
+服务端在每个成员 apply 后校验实际 schema；也可用 §5 的 `percona/raft_schema.sh` 做预检和独立指纹核对。该 wrapper 的 `--schema-tables` 是**目标**清单，仅供客户端派生期望指纹；新增表仍须与 DDL 同名。
+
+TRUNCATE 示例通过同一个单参数接口执行。`--schema-tables` 按完整 in-force 顺序填写；wrapper 会跳过预演实例上的 TRUNCATE，只在那里读取期望指纹：
+
+```bash
+bash percona/raft_schema.sh --sysbench=$SB --schema-db=perf --schema-tables=t,t2 \
+  --ddl="TRUNCATE TABLE perf.t2" \
+  --preview-host=127.0.0.1 --preview-port=43704 --preview-user=root \
+  --leader-host=127.0.0.1 --leader-port=$LEADER --leader-user=root \
+  --member 127.0.0.1:43701 --member 127.0.0.1:43702 --member 127.0.0.1:43703 \
+  --wait-applied
+```
 
 **服务端对 CREATE 类提案的判定**（`sql/raft_consensus/schema_transition_policy.cc:493-513`，
 本轮逐条读代码 + 实测确认；`percona/prepare.sh` 的循环就是按这个写的）：

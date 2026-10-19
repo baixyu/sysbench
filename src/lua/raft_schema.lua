@@ -3,18 +3,17 @@
 -- Percona Raft: 在活着的集群上加/改表（schema transition 辅助）
 --
 -- 依据：percona-server 的 Docs/raft_replication/perf_tool_plan.md §6.5。
--- 唯一合法的用户 DDL 通道是 SQL 函数：
---     PERCONA_RAFT_SCHEMA_TRANSITION(ddl, target_manifest_hex)
--- 而"目标 manifest"必须由调用方提供（DDL 的结果无法在不执行它的情况下预测），
--- 所以流程是三步：先在**预演实例**（Raft 关闭、schema 与集群一致）上执行 DDL 并派生
--- 目标 manifest，再对 **Leader** 提案，最后逐成员校验 epoch 与指纹。
+-- 唯一合法的用户 DDL 通道是单参数 SQL 函数：
+--     PERCONA_RAFT_SCHEMA_TRANSITION(ddl)
+-- 服务端根据 DDL 和当前 in-force schema 推导目标 manifest。预演实例只为客户端独立
+-- 派生期望指纹并做 schema 预检；流程是预演、对 **Leader** 提交单参数 DDL、逐成员核对。
 --
 -- 为什么本脚本只有"单端点"命令：Lua 层的 drv:connect() 不接受连接参数，
 -- 连接参数只能来自全局 --mysql-*。所以"预演实例 + Leader + 各成员"这三个端点
 -- 由外层 wrapper（percona/raft_schema.sh）串起来——本文件不新增任何 C 代码。
 --
 -- 命令：
---   preview  在预演实例上执行目标 DDL，并打印目标 manifest_hex / fingerprint
+--   preview  在预演实例上执行目标 DDL，并打印独立核对用的 fingerprint
 --   propose  对 Leader 提案，打印结果 JSON 的关键字段；非 APPLIED 即失败
 --   verify   在一台上核对 schema_epoch 与本机自派生的指纹
 --
@@ -29,7 +28,6 @@ sysbench.cmdline.options = {
    schema_db = {"schema（库）名", ""},
    schema_tables =
       {"目标表名，按**目标顺序**逗号分隔（顺序是声明的一部分）", ""},
-   manifest_hex = {"preview 派生的目标 manifest（十六进制）", ""},
    expect_fingerprint = {"期望的目标指纹（propose/verify 据此核对）", ""},
    wait_applied = {"提案后等待本机应用完成（按 to_epoch + 指纹核对）", false},
    wait_timeout = {"等待上限（秒）", 30},
@@ -146,7 +144,7 @@ local function status_value(con, name)
 end
 
 --
--- preview：在预演实例上执行 DDL 并派生目标 manifest
+-- preview：在预演实例上执行 DDL 并派生客户端核对用的期望指纹
 --
 
 function cmd_preview()
@@ -165,7 +163,6 @@ function cmd_preview()
    print("raft_schema.schema_db=" .. db)
    print("raft_schema.schema_tables=" .. tables)
    print("raft_schema.fingerprint=" .. json_string(json, "fingerprint"))
-   print("raft_schema.manifest_hex=" .. json_string(json, "manifest_hex"))
 end
 
 --
@@ -174,18 +171,13 @@ end
 
 function cmd_propose()
    local db, tables = require_schema_args()
-   local hex = sysbench.opt.manifest_hex
-   if hex == "" then
-      die("必须给 --manifest-hex（由 preview 命令打印）")
-   end
    local ddl = get_ddl()
    local con = connect()
 
    local epoch_before = status_value(con, "Percona_raft_schema_epoch")
 
    local json = con:query_row(string.format(
-      "SELECT PERCONA_RAFT_SCHEMA_TRANSITION(%s, %s)", sql_quote(ddl),
-      sql_quote(hex)))
+      "SELECT PERCONA_RAFT_SCHEMA_TRANSITION(%s)", sql_quote(ddl)))
    if json == nil then
       die("PERCONA_RAFT_SCHEMA_TRANSITION() 没有返回结果")
    end

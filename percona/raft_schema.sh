@@ -7,13 +7,13 @@
 # 一次 sysbench 进程只能连一个端点，所以：
 #
 #   0) 预检  预演实例上"在 force 的那几张表"的指纹 == 集群在 force 的指纹
-#   1) preview（预演实例，Raft 关闭、schema 与集群一致）→ 执行 DDL + 派生目标 manifest
-#   2) propose（Leader）                                → PERCONA_RAFT_SCHEMA_TRANSITION()
+#   1) preview（预演实例，Raft 关闭、schema 与集群一致）→ 执行 DDL + 派生独立期望指纹
+#   2) propose（Leader）                                → 单参数 PERCONA_RAFT_SCHEMA_TRANSITION(ddl)
 #   3) verify （每个成员各一次）                        → epoch + 本机自派生指纹
 #
-# 预检为什么必须在最前面：预演实例派生的是"目标 manifest"；若预演实例与集群在 force 的
-# 形状不同，目标就是错的，而成员派生后与目标不符会 **fail closed**（手册 §4.2.5 明确写了
-# 这条路径会把整个集群挡住）。所以先比指纹，再动预演实例。
+# 预检为什么必须在最前面：预演实例给客户端核对用的期望指纹；若预演实例与集群在 force 的
+# 形状不同，预检或 apply 后核对会失败。目标 manifest 由服务端从 DDL 和 in-force schema 推导。
+# 所以先比指纹，再动预演实例。
 #
 # 用法：
 #   percona/raft_schema.sh \
@@ -131,7 +131,7 @@ fi
 
 if [[ -z "$existing" ]]; then
   echo "⚠️  跳过预检：无法从 DDL 推出在 force 的表集合（${ddl_kind} 这类）。" >&2
-  echo "    请用 --existing-tables=t,t2 显式给出（不给就可能把一个错的目标 manifest 提上去）。" >&2
+  echo "    请用 --existing-tables=t,t2 显式给出，以便核对正确的 in-force 指纹。" >&2
 else
   echo "   在 force 的表集合（预检用）：${existing}"
   # 派生失败（表缺失/形状不符/连不上）时 sysbench 是**非 0 退出**的：必须自己接住并说出原因，
@@ -161,18 +161,23 @@ else
   echo "   预检通过"
 fi
 
-echo "=== 1/3 preview：在预演实例 ${PREVIEW_HOST}:${PREVIEW_PORT} 上执行 DDL 并派生目标 manifest ==="
+echo "=== 1/3 preview：在预演实例 ${PREVIEW_HOST}:${PREVIEW_PORT} 上预演并派生期望指纹 ==="
 # 注意：`preview_out=$(...)` 在 set -e 下**失败即退出**，连子进程的 FATAL 都打不出来
 # （实测：用户那边只看到 prepare.sh 的"transition 失败：sbtest1"，没有任何原因）⇒ 必须接住再打。
 preview_rc=0
-if [[ $SKIP_DDL -eq 1 ]]; then
+preview_skip_ddl=$SKIP_DDL
+if [[ "$ddl_kind" == "truncate" ]]; then
+  preview_skip_ddl=1
+  echo "   TRUNCATE 不改变 schema，跳过在预演实例上执行 DDL"
+fi
+if [[ $preview_skip_ddl -eq 1 ]]; then
   preview_out=$("$SYSBENCH" "$LUA" "${preview_conn[@]}" "${common[@]}" --skip-ddl "${ddl_args[@]}" preview 2>&1) || preview_rc=$?
 else
   preview_out=$("$SYSBENCH" "$LUA" "${preview_conn[@]}" "${common[@]}" "${ddl_args[@]}" preview 2>&1) || preview_rc=$?
 fi
 echo "$preview_out"
 if [[ $preview_rc -ne 0 ]]; then
-  echo "preview 步骤失败（rc=${preview_rc}）：在预演实例 ${PREVIEW_HOST}:${PREVIEW_PORT} 上执行 DDL / 派生目标 manifest 没成功。常见原因：" >&2
+  echo "preview 步骤失败（rc=${preview_rc}）：在预演实例 ${PREVIEW_HOST}:${PREVIEW_PORT} 上预演 / 派生期望指纹没成功。常见原因：" >&2
   grep -qE "Unknown database" <<<"$preview_out" && echo "  · 预演实例上没有库 \`$SCHEMA_DB\`（先用 Raft 关闭的实例把库和**在 force 的那几张表**建出来）" >&2
   grep -q "1050\|already exists" <<<"$preview_out" && echo "  · 目标表在预演实例上已存在（脚本本应自动加 --skip-ddl；可显式传 --skip-ddl）" >&2
   grep -q "MISSING_TABLE" <<<"$preview_out" && echo "  · 在 force 的表在预演实例上不存在/形状不符 ⇒ 用 mysqldump --no-data 从 Leader 搬一份结构过来" >&2
@@ -181,13 +186,11 @@ if [[ $preview_rc -ne 0 ]]; then
   exit 1
 fi
 
-manifest_hex=$(sed -n 's/^raft_schema\.manifest_hex=//p' <<<"$preview_out")
 fingerprint=$(sed -n 's/^raft_schema\.fingerprint=//p' <<<"$preview_out")
-[[ -n "$manifest_hex" ]] || { echo "preview 没给出 manifest_hex" >&2; exit 1; }
-[[ -n "$fingerprint"  ]] || { echo "preview 没给出 fingerprint" >&2; exit 1; }
+[[ -n "$fingerprint" ]] || { echo "preview 没给出 fingerprint" >&2; exit 1; }
 
-echo "=== 2/3 propose：对 Leader ${LEADER_HOST}:${LEADER_PORT} 提案 ==="
-propose_args=("${common[@]}" --manifest-hex="$manifest_hex" --expect-fingerprint="$fingerprint" "${ddl_args[@]}")
+echo "=== 2/3 propose：对 Leader ${LEADER_HOST}:${LEADER_PORT} 提交单参数 DDL ==="
+propose_args=("${common[@]}" --expect-fingerprint="$fingerprint" "${ddl_args[@]}")
 [[ $WAIT_APPLIED -eq 1 ]] && propose_args+=(--wait-applied)
 propose_rc=0
 "$SYSBENCH" "$LUA" "${leader_conn[@]}" "${propose_args[@]}" propose || propose_rc=$?

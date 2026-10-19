@@ -2,17 +2,17 @@
 #
 # prepare.sh —— 一条命令把"建表（受管 transition）"和"灌数"合并：
 #   ① `raft_prepare.lua ddl` 现算目标形状（与灌数用同一套参数，不重复实现形状逻辑）
-#   ② 对集群上**还不存在**的表，按声明顺序逐张走 PERCONA_RAFT_SCHEMA_TRANSITION
-#      （复用 raft_schema.sh：预检 → 预演实例派生目标 manifest → 对 Leader 提案 → 逐成员核对）
+#   ② 对集群上**还不存在**的表，按声明顺序逐张走单参数 PERCONA_RAFT_SCHEMA_TRANSITION(ddl)
+#      （复用 raft_schema.sh：预检 → 预演实例提供独立期望指纹 → 对 Leader 提案 → 逐成员核对）
 #   ③ 全部就位后跑 `raft_prepare.lua prepare --skip-ddl`（灌数 + 行长回读）
 #
 # 依据：percona-server 的 Docs/raft_replication/perf_tool_plan.md §6.5（活集群加/改表；一次只加一张表，
 #       目标清单的顺序就是声明顺序）与 §4（形状 / 行长口径）。
 #
-# 为什么是 wrapper 而不是改 Lua：Lua 层一次进程只能连**一个**端点，而目标 manifest 必须在
-# **预演实例**（Raft 关闭）上派生、提案必须打在 **Leader** 上 —— 与 raft_schema.sh 同一个理由。
-#   另：服务端没有"列出已声明表"的 SQL 接口（`PERCONA_RAFT_SCHEMA_MANIFEST(db,list)` 是"按清单派生"），
-#   所以完整目标清单必须由调用方给（`--schema-tables`），与 raft_schema.sh 的契约一致。
+# 为什么是 wrapper 而不是改 Lua：Lua 层一次进程只能连**一个**端点；提案必须打在 **Leader**，
+# 而预演实例用于预检和独立指纹核对。服务端自己从单参数 DDL 推导目标 manifest。
+#   `--schema-tables` 是客户端核对用的完整目标清单（PERCONA_RAFT_SCHEMA_MANIFEST 按给定清单派生），
+#   必须按声明顺序提供，与 raft_schema.sh 的校验约定一致。
 #
 # 用法：
 #   percona/prepare.sh --sysbench=./src/sysbench \
@@ -220,7 +220,7 @@ if [[ $MONITOR -eq 1 && -z "${RAFT_MONITOR_WRAPPED:-}" ]]; then
 fi
 
 echo "=== 0) 连接：Leader ${LEADER_HOST}:${LEADER_PORT}（用户 ${LEADER_USER}）、预演实例 ${PREVIEW_HOST}:${PREVIEW_PORT}（用户 ${PREVIEW_USER}）、成员 ${#MEMBERS[@]} 个 ==="
-echo "    步骤顺序：① 算 DDL（不连库）→ ② 读 Leader 的 information_schema 发现已有基表 → ③ 逐张 transition（这里先用预演实例派生目标 manifest）→ ④ 灌数 + 行长回读（Leader）→ ⑤ 跨成员核对"
+echo "    步骤顺序：① 算 DDL（不连库）→ ② 读 Leader 的 information_schema 发现已有基表 → ③ 逐张单参数 transition（预演实例提供独立期望指纹）→ ④ 灌数 + 行长回读（Leader）→ ⑤ 跨成员核对"
 
 # ── 1) 目标形状（DDL）────────────────────────────────────────────────────────
 echo "=== 1) 现算目标 DDL（raft_prepare.lua ddl）==="
