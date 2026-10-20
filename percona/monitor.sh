@@ -195,8 +195,10 @@ stop_samplers
 for m in "${MEMBERS[@]}"; do
   host=${m%%:*}; port=${m##*:}
   ts="$OUT_DIR/$(base_of "$m")"
+  summary_args=(--in-file="$ts.tsv" --ring-file="$ts.events.jsonl")
+  [[ -s "$OUT_DIR/client-intervals.tsv" ]] && summary_args+=(--client-file="$OUT_DIR/client-intervals.tsv")
   "$SYSBENCH" "$LUA" --mysql-host="$host" --mysql-port="$port" "${conn_args[@]}" summarize \
-    --in-file="$ts.tsv" --ring-file="$ts.events.jsonl" > "$ts.summary.txt" 2>&1 || echo "  [monitor] 警告：$host:$port 的汇总失败" >&2
+    "${summary_args[@]}" > "$ts.summary.txt" 2>&1 || echo "  [monitor] 警告：$host:$port 的汇总失败" >&2
 done
 
 echo
@@ -232,7 +234,7 @@ COMBINED="$OUT_DIR/${TAG}-combined.txt"
     echo "## 主机指标窗口摘要"
     for f in "${host_files[@]}"; do
       echo "### $f"
-      awk -F '\t' 'NR > 1 && $3 != "" { n++; cpu += $3; if ($4 > iowait) iowait = $4; if (!have_mem || $5 < min_mem) { min_mem = $5; have_mem = 1 } if ($10 > disk_util) disk_util = $10; if ($11 > disk_await) disk_await = $11; drops += $15; retrans += $16 } END { if (!n) print "samples=0（尚无完整计数器区间；检查同名 .log）"; else printf "samples=%d cpu_busy_avg=%.2f%% iowait_max=%.2f%% memavailable_min=%.0f disk_util_max=%.2f%% disk_await_max=%.2fms net_drops_delta=%.0f tcp_retrans_delta=%.0f\n", n, cpu/n, iowait, min_mem, disk_util, disk_await, drops, retrans }' "$f"
+      awk -F '\t' 'NR > 1 && $3 != "" { n++; cpu += $3; if ($4 > iowait) iowait = $4; if (!have_mem || $5 < min_mem) { min_mem = $5; have_mem = 1 } if ($10 > disk_util) disk_util = $10; if ($11 > disk_await) disk_await = $11; drops += $15; retrans += $16; if ($17 != "") { load += $17; if ($17 > load_max) load_max = $17; } if ($18 > procs_running) procs_running = $18; if ($19 > procs_blocked) procs_blocked = $19; ctxt += $20; sched_wait += $21; if ($22 > cpu_psi) cpu_psi = $22 } END { if (!n) print "samples=0（尚无完整计数器区间；检查同名 .log）"; else printf "samples=%d cpu_busy_avg=%.2f%% iowait_max=%.2f%% memavailable_min=%.0f disk_util_max=%.2f%% disk_await_max=%.2fms net_drops_delta=%.0f tcp_retrans_delta=%.0f load1_avg=%.2f load1_max=%.2f procs_running_max=%.0f procs_blocked_max=%.0f context_switches_avg_per_s=%.0f sched_wait_cpu_avg_core_s_per_s=%.3f cpu_psi_some_max=%.2f%%\n", n, cpu/n, iowait, min_mem, disk_util, disk_await, drops, retrans, load/n, load_max, procs_running, procs_blocked, ctxt/n, sched_wait/n, cpu_psi }' "$f"
     done
     echo
   fi

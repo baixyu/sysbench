@@ -257,11 +257,13 @@ $SB src/lua/raft_monitor.lua --mysql-host=127.0.0.1 --mysql-port=$LEADER --mysql
   --mysql-db=mysql ring-watch --out=/tmp/m.events.jsonl --interval-ms=250
 # 汇总 + 判读（人看的报告，最后一行是机器可读的 raft_monitor.result）
 $SB src/lua/raft_monitor.lua --mysql-host=127.0.0.1 --mysql-port=$LEADER --mysql-user=root \
-  --mysql-db=mysql summarize --in-file=/tmp/m.tsv --ring-file=/tmp/m.events.jsonl
+  --mysql-db=mysql summarize --in-file=/tmp/m.tsv --ring-file=/tmp/m.events.jsonl \
+  --client-file=/tmp/client-intervals.tsv
 ```
 
-- **TSV 形状**：头一行 `#\traft_monitor.v1\thost=…\tport=…\tinterval_ms=…\tts_epoch\t<状态量名列…>`，
-  每行一个采样点；时间戳取**服务端时钟**（`UNIX_TIMESTAMP(NOW(6))`）⇒ 三个成员的样本可以直接对齐。
+- **TSV 形状**：头一行 `#\traft_monitor.v1\thost=…\tport=…\tinterval_ms=…\tts_epoch\t<状态量名列…>\tclient_epoch`，
+  每行一个采样点；服务端 `ts_epoch` 使用 `UNIX_TIMESTAMP(NOW(6))`，并在末尾保存采样主机 `client_epoch`，成员数据可按服务端时钟对齐，
+  freeze 事件也可映射到 monitor 主机上的 sysbench 区间时间。状态量列位置保持原有顺序。
 - **采什么**（一次往返取回全部）：位点（commit / applier_progress / applying / local_durable /
   durable_checkpoint / durable_quorum）、等待类（apply_barrier_entries、apply_dependency_waits、
   write_permit_waits、caught_up_waits、admission_hold_timeouts）、结果未定（client_delivery_unknown 等 6 个）、
@@ -271,6 +273,14 @@ $SB src/lua/raft_monitor.lua --mysql-host=127.0.0.1 --mysql-port=$LEADER --mysql
   MySQL 侧旁证（Threads_running / InnoDB 行读写 / buffer pool / fsync / 数据字节 / Queries）。汇总会给出
   queries（含 monitor 自身查询）、WAL、行读写、数据字节和 fsync 的每秒速率、WAL 平均 records/batch 及 buffer pool 命中率。
   **缺的状态量留空，不编 0**。
+- 新增的 freeze 折叠读数会记录成功次数、折叠前全 journal 扫描与发布后 reload 校验的累计字节数/耗时、重写 journal 与 tombstone segment 的字节数/耗时，
+  并保存最近一次 freeze 的开始/结束 epoch 时间和总耗时。汇总按采样观察到的每次计数变化列明细；如果一个采样间隔内发生多次，
+  累计次数准确，`last-*` 只能给出最近一次的明细，此时缩短 `--interval-ms`。完整性扫描仍覆盖整个 journal，不跳过校验。
+- journal 耐久链会按窗口输出 sync/open/write/fsync/close 的累计用时与每次 sync 均值，以及 journal writer 和 APPLIED batch 的
+  records/batch 与 fsync 时间。recent_events 的各阶段分布增加 p99。并行 apply 会额外记录 slot/dependency 等待时间、worker queue
+  等待时间和最大队列深度；这些数据用于解释 K=1/K>1 的差别，不表示高并行度必然更快。
+- Freeze 前后客户端 p99 从 `monitor.sh` 生成的 `client-intervals.tsv` 读取。压测命令需使用 `--report-interval=1 --percentile=99`；
+  汇总比较 freeze 开始前最近 5 个和结束后最早 5 个区间的 p99 中位数/最大值。手动汇总时用 `--client-file` 指定该文件。
 - **判读（verdict）**按优先级给：`UNKNOWN_OUTCOMES`（客户端拿到 3197 ⇒ 反查那几笔的 local_apply）、
   `COMMIT_GATE_QUEUE`、`APPLY_DEPENDENCY_WAIT`、`APPLIER_LAG`、`DURABLE_LAG`、`QUORUM_LAG`（**只在 leader 上判**）、
   `PERMIT_QUEUE`、`POST_COMMIT_WAIT`（ring 里 `proposal→local_apply` 空档）、`COMMIT_STALLED`（只在窗口内确实
@@ -327,7 +337,7 @@ bash percona/monitor.sh --sysbench=$SB \
   （负载期间轮询到的新 recent_events）、`.summary.txt`（逐台完整判读）、`.sample.log` / `.ring-watch.log`、
   `command.log`（被包命令原样输出）、`phase-markers.tsv`（以 `===` 开头的流程阶段及时间）、
   `client-intervals.tsv`（sysbench 输出的区间 TPS/QPS/延迟行），以及 **`<tag>-combined.txt`：三台并排 +
-  逐台完整汇总的合并报告**。要采集客户端区间数据，被包的 sysbench 命令需开启 `--report-interval`。
+  逐台完整汇总的合并报告**。要采集 freeze 前后客户端 p99，被包的 sysbench 命令需开启 `--report-interval=1 --percentile=99`。
 - `--ring-interval-ms` 控制事件轮询，默认 250ms。服务端事件环有界，轮询间隔内若新增事件超过环容量仍可能丢事件；
   JSONL 会对多次快照去重。`--print-full` 把合并报告也打到屏幕上。wrapper 检查采样文件表头含目标端口和服务端主机名；
   `raft_monitor sample` 自己也会拒绝写进"已是另一台写的"文件。
@@ -337,7 +347,9 @@ bash percona/monitor.sh --sysbench=$SB \
   并可用 `--prometheus-instance HOST=INSTANCE` 覆盖默认的 `HOST:9100` 标签。主机采样间隔用 `--host-interval-ms`，
   默认 1000ms。Prometheus/Node Exporter 端点需要能从压测机通过 HTTP 访问。
 - 主机原始数据写入 `<tag>-host-<host>.tsv`，采集错误写入同名 `.tsv.log`；不可达或缺少对应 exporter 指标时只影响主机数据，
-  不会中断被包负载。采集 CPU 忙碌率与 iowait、可用内存、磁盘读写速率/IOPS/利用率/await、网络吞吐与丢包、TCP 重传。
+  不会中断被包负载。采集 CPU 忙碌率与 iowait、load1、runnable/blocked 进程数、context switch 速率、调度等待时间、CPU PSI，
+  可用内存、磁盘读写速率/IOPS/利用率/await、网络吞吐与丢包、TCP 重传。调度等待/CPU PSI 受 Linux 内核和 Node Exporter collector
+  配置影响，指标缺失时对应列留空。主机指标适合并行 apply 压测时判断是否有 CPU/调度压力。
   磁盘统计排除 loop、dm、md 及分区设备；网络统计排除 loopback 与常见容器虚拟接口；TCP 重传依赖 Node Exporter 的 netstat collector。
 - 看什么：`post_commit_gap_p95_us`（提交完成→本机 apply 的空档）、`max_apply_lag` / `max_durable_lag`
   （本机游标落后 commit 的峰值）、`max_quorum_lag`（leader 侧）、`unknown_delta`（结果未定）。

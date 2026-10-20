@@ -11,6 +11,8 @@ import urllib.request
 
 METRIC_NAMES = (
     "node_cpu_seconds_total|node_memory_MemAvailable_bytes|"
+    "node_load1|node_procs_running|node_procs_blocked|node_context_switches_total|"
+    "node_schedstat_waiting_seconds_total|node_pressure_cpu_waiting_seconds_total|"
     "node_disk_read_bytes_total|node_disk_written_bytes_total|"
     "node_disk_reads_completed_total|node_disk_writes_completed_total|"
     "node_disk_io_time_seconds_total|node_disk_read_time_seconds_total|"
@@ -120,6 +122,20 @@ def summarize(samples, previous, elapsed):
     mem = grouped(samples, "node_memory_MemAvailable_bytes")
     mem_available = mem[0][1] if mem else None
 
+    def gauge(metric):
+        values = grouped(samples, metric)
+        return values[0][1] if values else None
+
+    load1 = gauge("node_load1")
+    procs_running = gauge("node_procs_running")
+    procs_blocked = gauge("node_procs_blocked")
+    context_switch_rate = (rate_sum(samples, previous, "node_context_switches_total", "", elapsed)
+                           if grouped(samples, "node_context_switches_total") else None)
+    sched_wait_rate = (rate_sum(samples, previous, "node_schedstat_waiting_seconds_total", "cpu", elapsed)
+                       if grouped(samples, "node_schedstat_waiting_seconds_total") else None)
+    cpu_psi_rate = (rate_sum(samples, previous, "node_pressure_cpu_waiting_seconds_total", "", elapsed)
+                    if grouped(samples, "node_pressure_cpu_waiting_seconds_total") else None)
+
     skipped_disks = ("loop", "ram", "dm-", "md", "zram", "sr")
     disk_devices = set()
     disk_read_bytes = disk_write_bytes = read_ops = write_ops = 0.0
@@ -202,7 +218,9 @@ def summarize(samples, previous, elapsed):
     return [busy_pct, iowait_pct, mem_available,
             disk_read_rate, disk_write_rate, read_ops / elapsed if elapsed > 0 else 0.0,
             write_ops / elapsed if elapsed > 0 else 0.0, disk_util_max, disk_await_max,
-            ",".join(sorted(disk_devices)), net_rx, net_tx, drops, retrans_delta]
+            ",".join(sorted(disk_devices)), net_rx, net_tx, drops, retrans_delta,
+            load1, procs_running, procs_blocked, context_switch_rate,
+            sched_wait_rate, 100.0 * cpu_psi_rate if cpu_psi_rate is not None else None]
 
 
 def main():
@@ -219,7 +237,8 @@ def main():
     columns = ["epoch", "source_epoch", "cpu_busy_pct", "cpu_iowait_pct", "memavailable_bytes",
                "disk_read_Bps", "disk_write_Bps", "disk_read_iops", "disk_write_iops", "disk_util_max_pct",
                "disk_await_max_ms", "disk_devices", "net_rx_Bps", "net_tx_Bps", "net_drops_delta",
-               "tcp_retrans_delta"]
+               "tcp_retrans_delta", "load1", "procs_running", "procs_blocked",
+               "context_switches_per_s", "sched_wait_cpu_s_per_s", "cpu_psi_some_pct"]
     previous = None
     previous_source_epoch = None
     last_error = None

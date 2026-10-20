@@ -29,6 +29,7 @@ sysbench.cmdline.options = {
    out = {"sample：TSV 输出路径（同名 .stop 文件 = 停止开关）；ring：JSON 输出路径", ""},
    in_file = {"summarize：要分析的 TSV", ""},
    ring_file = {"summarize：可选的 recent_events JSON/JSONL 文件", ""},
+   client_file = {"summarize：可选的 monitor.sh 客户端区间输出（用于 freeze 前后 p99）", ""},
    interval_ms = {"sample：采样间隔（毫秒）", 1000},
    duration_s = {"sample：最长采样秒数（0 = 采到 <out>.stop 出现）", 0},
    lag_warn = {"summarize：apply 滞后告警阈值（条目数）", 200},
@@ -104,6 +105,32 @@ local VARS = {
    {"Innodb_rows_updated", "c"}, {"Innodb_rows_deleted", "c"}, {"Innodb_rows_read", "c"},
    {"Innodb_data_read", "c"}, {"Innodb_data_written", "c"},
    {"Queries", "c"},
+   -- 新指标只追加，保留现有 TSV 的列顺序兼容性。
+   {"Percona_raft_journal_sync_calls", "c"}, {"Percona_raft_journal_sync_us", "c"},
+   {"Percona_raft_journal_open_us", "c"},
+   {"Percona_raft_journal_close_us", "c"}, {"Percona_raft_journal_dir_sync_us", "c"},
+   {"Percona_raft_journal_batches", "c"}, {"Percona_raft_journal_batch_fsync_us", "c"},
+   {"Percona_raft_journal_batch_records", "c"},
+   {"Percona_raft_journal_applied_batch_records", "c"},
+   {"Percona_raft_apply_slot_waits", "c"}, {"Percona_raft_apply_slot_wait_us", "c"},
+   {"Percona_raft_apply_dependency_wait_us", "c"},
+   {"Percona_raft_apply_dependency_wait_samples", "c"},
+   {"Percona_raft_apply_worker_queue_wait_samples", "c"},
+   {"Percona_raft_apply_worker_queue_wait_us", "c"},
+   {"Percona_raft_apply_worker_queue_max", "g"},
+   {"Percona_raft_journal_compaction_successes", "c"},
+   {"Percona_raft_journal_compaction_scan_bytes", "c"},
+   {"Percona_raft_journal_compaction_scan_us", "c"},
+   {"Percona_raft_journal_compaction_rewrite_bytes", "c"},
+   {"Percona_raft_journal_compaction_rewrite_us", "c"},
+   {"Percona_raft_journal_compaction_total_us", "c"},
+   {"Percona_raft_journal_compaction_last_scan_bytes", "g"},
+   {"Percona_raft_journal_compaction_last_scan_us", "g"},
+   {"Percona_raft_journal_compaction_last_rewrite_bytes", "g"},
+   {"Percona_raft_journal_compaction_last_rewrite_us", "g"},
+   {"Percona_raft_journal_compaction_last_total_us", "g"},
+   {"Percona_raft_journal_compaction_last_start_epoch_us", "g"},
+   {"Percona_raft_journal_compaction_last_end_epoch_us", "g"},
 }
 
 local TYPE_OF = {}
@@ -136,6 +163,9 @@ local function sample_once(con)
    rs:free()
    local cells = { ts }
    for _, v in ipairs(VARS) do cells[#cells + 1] = m[v[1]] or "" end
+   -- Append the local timestamp to preserve the established status-column positions.
+   -- monitor.sh uses it to map server freeze epochs to client report intervals.
+   cells[#cells + 1] = tostring(os.time())
    return table.concat(cells, "\t")
 end
 
@@ -203,7 +233,7 @@ local function cmd_sample()
    local fh, err = io.open(sysbench.opt.out, "w")
    if fh == nil then die("写不了 %s：%s", sysbench.opt.out, tostring(err)) end
    -- 头也**全用制表符**分隔：混用空格会让下游按 \t 切列时把元数据与第一个名字粘在一起
-   fh:write(string.format("#\traft_monitor.v1\thost=%s\tport=%s\tinterval_ms=%d\tts_epoch\t%s\n",
+   fh:write(string.format("#\traft_monitor.v1\thost=%s\tport=%s\tinterval_ms=%d\tts_epoch\t%s\tclient_epoch\n",
                           host, port, interval, table.concat(names, "\t")))
    fh:flush()
 
@@ -389,6 +419,43 @@ local function sum_of(list)
    return s
 end
 
+local function read_client_p99(path)
+   local samples = {}
+   if path == "" then return samples end
+   for line in read_file(path):gmatch("[^\n]+") do
+      local stamp, report = line:match("^([%d%.]+)\t(.*)$")
+      if stamp and report then
+         -- 一行里会有多个 `lat (ms,NN%): x`（实测 sysbench 默认就打 95% 和 99%）：
+         -- 必须遍历所有匹配，只认 99% 那一个；取第一个匹配会拿到 95%。
+         for percentile, latency in report:gmatch("lat %(ms,%s*(%d+)%%%s*%)%s*:%s*([%d%.]+)") do
+            if tonumber(percentile) == 99 and tonumber(latency) then
+               samples[#samples + 1] = {ts = tonumber(stamp), p99_ms = tonumber(latency)}
+               break
+            end
+         end
+      end
+   end
+   return samples
+end
+
+local function p99_window(samples, boundary, before)
+   local candidates, selected = {}, {}
+   for _, sample in ipairs(samples) do
+      if (before and sample.ts < boundary) or (not before and sample.ts > boundary) then
+         candidates[#candidates + 1] = sample
+      end
+   end
+   table.sort(candidates, function(a, b)
+      if before then return a.ts > b.ts else return a.ts < b.ts end
+   end)
+   for i = 1, math.min(5, #candidates) do
+      selected[#selected + 1] = candidates[i].p99_ms
+   end
+   table.sort(selected)
+   if #selected == 0 then return nil end
+   return {n = #selected, median = selected[math.floor((#selected + 1) / 2)], max = selected[#selected]}
+end
+
 local function cmd_summarize()
    if sysbench.opt.in_file == "" then die("summarize 需要 --in-file=<TSV>") end
    local text = read_file(sysbench.opt.in_file)
@@ -399,18 +466,23 @@ local function cmd_summarize()
    for cell in lines[1]:gmatch("[^\t]+") do header[#header + 1] = cell end
    -- 头是 "# raft_monitor.v1 host=… port=… interval_ms=… ts_epoch <名字…>"：
    -- 用 ts_epoch 这个标记定位名字列（不要写死下标，元数据列以后可能增加）
-   local names, marker = {}, nil
+   local names, marker, client_epoch_column = {}, nil, nil
    for i, cell in ipairs(header) do
       if cell == "ts_epoch" then marker = i end
+      if cell == "client_epoch" then client_epoch_column = i end
    end
    if marker == nil then die("这不像 raft_monitor 的 TSV（头里没有 ts_epoch 标记）：%s", sysbench.opt.in_file) end
-   for i = marker + 1, #header do names[#names + 1] = header[i] end
-   local series, ts_all = {}, {}
+   for i = marker + 1, #header do
+      if header[i] ~= "client_epoch" then names[#names + 1] = header[i] end
+   end
+   local has_client_epoch = client_epoch_column ~= nil
+   local series, ts_all, client_ts_all = {}, {}, {}
    for _, n in ipairs(names) do series[n] = {} end
    for i = 2, #lines do
       local cells = split_tabs(lines[i])
       if #cells >= #names + 1 then
          ts_all[#ts_all + 1] = tonumber(cells[1]) or 0
+         if has_client_epoch then client_ts_all[#client_ts_all + 1] = tonumber(cells[#names + 2]) end
          for j, n in ipairs(names) do series[n][#series[n] + 1] = cells[j + 1] end
       end
    end
@@ -455,6 +527,13 @@ local function cmd_summarize()
       else run = 0 end
    end
    local span = (ts_all[n] - ts_all[1])
+   local client_p99 = read_client_p99(sysbench.opt.client_file)
+   local clock_offsets = {}
+   for i, client_ts in ipairs(client_ts_all) do
+      if client_ts then clock_offsets[#clock_offsets + 1] = ts_all[i] - client_ts end
+   end
+   table.sort(clock_offsets)
+   local client_server_offset = #clock_offsets > 0 and pct(clock_offsets, 50) or nil
 
    print("=== raft_monitor 汇总 ===")
    print(string.format("samples=%d span=%.1fs (%.2fs/样本) commit_index %s→%s",
@@ -518,6 +597,10 @@ local function cmd_summarize()
    local interesting = {
       "Percona_raft_apply_barrier_entries", "Percona_raft_apply_dependency_waits",
       "Percona_raft_apply_parallel_dispatches",
+      "Percona_raft_apply_slot_waits", "Percona_raft_apply_slot_wait_us",
+      "Percona_raft_apply_dependency_wait_us",
+      "Percona_raft_apply_dependency_wait_samples",
+      "Percona_raft_apply_worker_queue_wait_samples", "Percona_raft_apply_worker_queue_wait_us",
       "Percona_raft_write_permit_waits", "Percona_raft_write_permit_wait_us",
       "Percona_raft_admission_hold_timeouts", "Percona_raft_caught_up_waits",
       "Percona_raft_caught_up_wait_us",
@@ -525,10 +608,18 @@ local function cmd_summarize()
       "Percona_raft_proposal_uncertain", "Percona_raft_proposal_unknown",
       "Percona_raft_client_apply_failed_unknown", "Percona_raft_client_wait_timeout",
       "Percona_raft_journal_write_us", "Percona_raft_journal_fsync_us",
+      "Percona_raft_journal_sync_us", "Percona_raft_journal_sync_calls",
+      "Percona_raft_journal_open_us", "Percona_raft_journal_close_us",
+      "Percona_raft_journal_dir_sync_us", "Percona_raft_journal_batches",
+      "Percona_raft_journal_batch_fsync_us", "Percona_raft_journal_batch_records",
+      "Percona_raft_journal_applied_batch_records",
       "Percona_raft_journal_applied_batch_fsync_us", "Percona_raft_journal_applied_batches",
       "Percona_raft_journal_scan_us", "Percona_raft_journal_scan_calls",
       "Percona_raft_applier_apply_count", "Percona_raft_applier_apply_engine_us",
       "Percona_raft_applier_applying_us", "Percona_raft_applier_slow_applies",
+      "Percona_raft_journal_compaction_successes", "Percona_raft_journal_compaction_scan_bytes",
+      "Percona_raft_journal_compaction_scan_us", "Percona_raft_journal_compaction_rewrite_bytes",
+      "Percona_raft_journal_compaction_rewrite_us", "Percona_raft_journal_compaction_total_us",
       "Percona_raft_freeze_deferred_by_lagging_member", "Percona_raft_binlog_freeze_deferrals",
       "Percona_raft_binlog_watermark_writes", "Percona_raft_binlog_derived_writes",
       "Percona_raft_binlog_derived_syncs", "Percona_raft_binlog_backfilled_entries",
@@ -551,6 +642,50 @@ local function cmd_summarize()
          local extra = mv > 0 and string.format("  [回退 %d 次！]", mv) or ""
          print(string.format("  %-52s %+d%s", nm, d, extra))
       end
+   end
+
+   local journal_syncs = delta("Percona_raft_journal_sync_calls")
+   local journal_sync_us = delta("Percona_raft_journal_sync_us")
+   if journal_syncs and journal_syncs > 0 then
+      local function per_sync(name)
+         local value = delta(name)
+         return value and string.format("%.3fms", value / journal_syncs / 1000) or "n/a"
+      end
+      print(string.format("\n-- journal 耐久等待链（窗口累计 / 每次 sync 均值）--\n  syncs=%d total=%s open=%s write=%s fsync=%s close=%s",
+         journal_syncs, per_sync("Percona_raft_journal_sync_us"),
+         per_sync("Percona_raft_journal_open_us"), per_sync("Percona_raft_journal_write_us"),
+         per_sync("Percona_raft_journal_fsync_us"), per_sync("Percona_raft_journal_close_us")))
+      local dir_sync = delta("Percona_raft_journal_dir_sync_us")
+      if dir_sync and dir_sync > 0 then
+         print(string.format("  first-create directory sync total=%.3fms (不计入每事务 sync 均值)", dir_sync / 1000))
+      end
+   end
+   local journal_batches = delta("Percona_raft_journal_batches")
+   local journal_batch_fsync = delta("Percona_raft_journal_batch_fsync_us")
+   local applied_batches = delta("Percona_raft_journal_applied_batches")
+   local applied_records = delta("Percona_raft_journal_applied_batch_records")
+   if (journal_batches and journal_batches > 0) or (applied_batches and applied_batches > 0) then
+      print(string.format("  group-commit batches=%s records/batch=%s fsync_total=%.3fms; APPLIED batches=%s records/batch=%s fsync_total=%.3fms",
+         tostring(journal_batches or 0),
+         journal_batches and journal_batches > 0 and string.format("%.2f", (delta("Percona_raft_journal_batch_records") or 0) / journal_batches) or "n/a",
+         (journal_batch_fsync or 0) / 1000,
+         tostring(applied_batches or 0),
+         applied_batches and applied_batches > 0 and string.format("%.2f", (applied_records or 0) / applied_batches) or "n/a",
+         (delta("Percona_raft_journal_applied_batch_fsync_us") or 0) / 1000))
+   end
+   local slot_waits = delta("Percona_raft_apply_slot_waits")
+   local slot_wait_us = delta("Percona_raft_apply_slot_wait_us")
+   local dependency_waits = delta("Percona_raft_apply_dependency_wait_samples")
+   local dependency_wait_us = delta("Percona_raft_apply_dependency_wait_us")
+   local queue_samples = delta("Percona_raft_apply_worker_queue_wait_samples")
+   local queue_wait_us = delta("Percona_raft_apply_worker_queue_wait_us")
+   if (slot_waits and slot_waits > 0) or (dependency_waits and dependency_waits > 0) or
+      (queue_samples and queue_samples > 0) then
+      print(string.format("\n-- applier 调度等待（窗口均值）--\n  slot: n=%s mean=%.3fms; dependency: n=%s mean=%.3fms; worker queue: n=%s mean=%.3fms max_depth=%s",
+         tostring(slot_waits or 0), slot_waits and slot_waits > 0 and (slot_wait_us or 0) / slot_waits / 1000 or 0,
+         tostring(dependency_waits or 0), dependency_waits and dependency_waits > 0 and (dependency_wait_us or 0) / dependency_waits / 1000 or 0,
+         tostring(queue_samples or 0), queue_samples and queue_samples > 0 and (queue_wait_us or 0) / queue_samples / 1000 or 0,
+         tostring(num("Percona_raft_apply_worker_queue_max", n) or 0)))
    end
 
    -- 按窗口秒数归一化，方便和 sysbench 的 report-interval 对齐比较。
@@ -585,6 +720,14 @@ local function cmd_summarize()
    local gauges = {
       "Percona_raft_journal_retained_records", "Percona_raft_peer_below_compacted_start",
       "Percona_raft_apply_max_in_flight", "Percona_raft_caught_up_real_lag",
+      "Percona_raft_apply_worker_queue_max",
+      "Percona_raft_journal_compaction_last_scan_bytes",
+      "Percona_raft_journal_compaction_last_scan_us",
+      "Percona_raft_journal_compaction_last_rewrite_bytes",
+      "Percona_raft_journal_compaction_last_rewrite_us",
+      "Percona_raft_journal_compaction_last_total_us",
+      "Percona_raft_journal_compaction_last_start_epoch_us",
+      "Percona_raft_journal_compaction_last_end_epoch_us",
       "Percona_raft_freeze_live_member_floor", "Percona_raft_durable_quorum_members",
       "Percona_raft_leader_generation", "Percona_raft_caught_up_max_lag",
       "Innodb_buffer_pool_pages_dirty", "Innodb_buffer_pool_pages_data",
@@ -625,16 +768,69 @@ local function cmd_summarize()
          local v = by_stage[st]
          if v ~= nil and #v > 0 then
             table.sort(v)
-            print(string.format("  %-16s n=%-4d p50=%-9d p95=%-9d max=%d µs", st, #v, pct(v, 50), pct(v, 95), v[#v]))
+            print(string.format("  %-16s n=%-4d p50=%-9d p95=%-9d p99=%-9d max=%d µs", st, #v, pct(v, 50), pct(v, 95), pct(v, 99), v[#v]))
          end
       end
       if #gaps > 0 then
          table.sort(gaps)
-         print(string.format("  proposal→local_apply 空档: n=%d p50=%d p95=%d max=%d µs",
-                             #gaps, pct(gaps, 50), pct(gaps, 95), gaps[#gaps]))
+         print(string.format("  proposal→local_apply 空档: n=%d p50=%d p95=%d p99=%d max=%d µs",
+                             #gaps, pct(gaps, 50), pct(gaps, 95), pct(gaps, 99), gaps[#gaps]))
       elseif by_stage["client_delivery"] == nil and by_stage["proposal"] == nil then
          print("  注意：这份 ring 只有 apply 侧阶段（采样时本机是 follower）⇒ 看不到 proposal/client_delivery；")
          print("        要定位\"提交完成→本机 apply\"那段空档，必须看 **leader** 的那一份 ring。")
+      end
+   end
+
+   -- Each row captures the most recent completed freeze. Compactions are serialized by the journal
+   -- mutex; if more than one completed between samples, the counter delta shows how many occurred,
+   -- while the last-* fields describe the newest one. Client p99 uses the nearest five report intervals.
+   local freeze_count = delta("Percona_raft_journal_compaction_successes") or 0
+   if freeze_count > 0 then
+      print(string.format("\n-- Freeze journal 折叠（成功 %d 次）--", freeze_count))
+      local events, missed = {}, 0
+      local successes = series["Percona_raft_journal_compaction_successes"]
+      for i = 2, n do
+         local old, current = tonumber(successes[i - 1]), tonumber(successes[i])
+         if old and current and current > old then
+            local count = current - old
+            if count > 1 then missed = missed + count - 1 end
+            events[#events + 1] = {
+               count = count,
+               start_us = num("Percona_raft_journal_compaction_last_start_epoch_us", i),
+               end_us = num("Percona_raft_journal_compaction_last_end_epoch_us", i),
+               scan_bytes = num("Percona_raft_journal_compaction_last_scan_bytes", i),
+               scan_us = num("Percona_raft_journal_compaction_last_scan_us", i),
+               rewrite_bytes = num("Percona_raft_journal_compaction_last_rewrite_bytes", i),
+               rewrite_us = num("Percona_raft_journal_compaction_last_rewrite_us", i),
+               total_us = num("Percona_raft_journal_compaction_last_total_us", i),
+            }
+         end
+      end
+      for i, event in ipairs(events) do
+         local pre, post
+         if #client_p99 > 0 and event.start_us and event.end_us and client_server_offset then
+            pre = p99_window(client_p99, event.start_us / 1e6 - client_server_offset, true)
+            post = p99_window(client_p99, event.end_us / 1e6 - client_server_offset, false)
+         end
+         local function shown_window(window)
+            if not window then return "n/a" end
+            return string.format("median=%.3fms,max=%.3fms,n=%d", window.median, window.max, window.n)
+         end
+         print(string.format("  freeze#%d%s scan=%sB/%.3fms rewrite=%sB/%.3fms total=%.3fms p99_before[%s] p99_after[%s]",
+            i, event.count > 1 and string.format(" (间隔内共%d次，仅最近一次有明细)", event.count) or "",
+            tostring(event.scan_bytes or "n/a"), (event.scan_us or 0) / 1000,
+            tostring(event.rewrite_bytes or "n/a"), (event.rewrite_us or 0) / 1000,
+            (event.total_us or 0) / 1000, shown_window(pre), shown_window(post)))
+      end
+      if missed > 0 then
+         print(string.format("  注意：采样间隔内还有 %d 次成功折叠没有单独的 last-* 明细；缩短 --interval-ms 可避免遗漏。", missed))
+      end
+      if #client_p99 == 0 then
+         print("  客户端 p99 未采到；压测命令请带 --report-interval=1 和 --percentile=99，并把 monitor.sh 的 client-intervals.tsv 传给 --client-file。")
+      elseif #events == 0 then
+         print("  p99 区间不可关联：monitor 采样没有观察到成功折叠计数变化。")
+      elseif not client_server_offset then
+         print("  p99 区间不可关联：采样文件没有 client_epoch；请重新采集 monitor TSV。")
       end
    end
 
