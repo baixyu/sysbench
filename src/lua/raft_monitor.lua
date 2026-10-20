@@ -470,7 +470,7 @@ local function cmd_summarize()
       -- applier_ready 是"该瞬间 applied == committed"（nuraft_adapter.h），是瞬时判断不是状态：
       -- 末=OFF 只说明最后一个采样点差一点点，不代表没在 apply——要和 apply_lag 一起读。
       if ar and ar[n] == "OFF" then
-         print("  注：applier_ready=OFF 表示最后一个采样点 applied 尚未追平 committed（见下方 apply 滞后峰值），不是"没在 apply"")
+         print("  注：applier_ready=OFF 表示最后一个采样点 applied 尚未追平 committed（见下方 apply 滞后峰值），不是\"没在 apply\"")
       end
    end
 
