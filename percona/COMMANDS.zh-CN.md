@@ -409,6 +409,22 @@ bash percona/prepare.sh --sysbench=$SB \
 只建表用 `--skip-load`，只灌数用 `--skip-ddl`。`--schema-tables` 的**顺序不影响服务端判定**
 （见 §7 的集合语义），它只决定目标 manifest 里表的排列。
 
+### 并发灌数（`--load-threads=N`，默认 1）
+
+```bash
+bash percona/prepare.sh --sysbench=$SB --schema-db=$DB --mysql-db=$DB \
+  --table-prefix=sbtest --tables=128 --table-size=200000 --row-length=400 --seed=42 \
+  --preview-host=... --leader-host=$LEADER --member ... \
+  --skip-ddl --load-threads=8
+```
+
+- 每个线程只插自己那段 id：`[floor(total*(k-1)/N)+1, floor(total*k/N)]`，各线程用**自己的连接**
+  （sysbench 的 `PARALLEL_COMMAND`，线程号取 `sysbench.tid`），所以 id 无重叠、无空洞；
+- 要求表已存在（并发时带 `--skip-ddl`；否则每个 worker 都会去 `CREATE TABLE`，脚本直接拒绝）；
+- 行长回读不并发：所有线程结束后由 wrapper 单独跑一次 `raft_prepare.lua rowlen`；
+- 灌的仍是"每笔 `--batch` 行的 `INSERT`"⇒ 每批在 Raft 里是一笔受管事务，`N` 提高的是
+  **提案并发度**；分片只在**同一张表内**按主键切分，跨表仍是顺序遍历。
+
 ---
 
 ## 6. 验收命令集

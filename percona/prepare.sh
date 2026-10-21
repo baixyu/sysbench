@@ -39,6 +39,10 @@
 #   --preview-password=PW   预演实例的密码（缺省取 MYSQL_PWD）
 #   --leader-password=PW    Leader/成员 的密码（缺省取 MYSQL_PWD）
 #   --existing-tables=a,b   显式给出"在 force"的表集合（预检用；缺省= 清单里已存在的前缀）
+#   --load-threads=N        并发灌数线程数（默认 1）。每个线程只插自己那段 id 分片：
+#                           id 范围 [floor(total*(k-1)/N)+1, floor(total*k/N)]，各自独立连接。
+#                           N>1 时必须 --skip-ddl（建表要事先完成），行长回读在所有线程
+#                           结束后由本脚本单独跑一次 rowlen。实测并发只影响灌数阶段。
 #   --skip-ddl              只灌数（等价于直接跑 raft_prepare --skip-ddl）
 #   --skip-load             只建表不灌数
 #   --verify                结束时做跨成员聚合核对（percona/verify.sh --skip-dump）
@@ -89,6 +93,7 @@ CLI_EXTRA=(); SB_EXTRA=(); SB_EXTRA_STR=()
 if [[ -n "${SYSBENCH_ARGS:-}" ]]; then SB_EXTRA_STR+=("$SYSBENCH_ARGS"); read -r -a SB_EXTRA <<<"$SYSBENCH_ARGS"; fi
 MEMBERS=()
 SKIP_DDL=0; SKIP_LOAD=0; DO_VERIFY=0; WAIT_APPLIED=1; ALLOW_NONEMPTY=0
+LOAD_THREADS=1
 MONITOR=0; MONITOR_INTERVAL_MS=1000; MONITOR_RING_INTERVAL_MS=250; MONITOR_OUT_DIR=
 MONITOR_HOST_METRICS=0; MONITOR_HOST_INTERVAL_MS=1000; MONITOR_NODE_EXPORTER_PORT=9100; MONITOR_PROMETHEUS_URL=
 MONITOR_NODE_EXPORTER_URLS=(); MONITOR_PROMETHEUS_INSTANCES=()
@@ -120,6 +125,7 @@ while [[ $# -gt 0 ]]; do
     --sysbench-args) SB_EXTRA_STR+=("$2"); read -r -a SB_EXTRA <<<"$2"; shift 2;;
     --member) MEMBERS+=("$2"); shift 2;;
     --skip-ddl) SKIP_DDL=1; shift;;
+    --load-threads) LOAD_THREADS=$2; shift 2;;
     --skip-load) SKIP_LOAD=1; shift;;
     --verify) DO_VERIFY=1; shift;;
     --allow-nonempty) ALLOW_NONEMPTY=1; shift;;
@@ -481,10 +487,23 @@ else
   load_args=(--mysql-host="$LEADER_HOST" --mysql-port="$LEADER_PORT" --mysql-user="$LEADER_USER")
   [[ -n "$LEADER_PASSWORD" ]] && load_args+=(--mysql-password="$LEADER_PASSWORD")
   [[ ${#SB_EXTRA[@]} -gt 0 ]] && load_args+=(${SB_EXTRA[@]+"${SB_EXTRA[@]}"})
+  [[ "$LOAD_THREADS" =~ ^[0-9]+$ && "$LOAD_THREADS" -ge 1 ]] || {
+    echo "--load-threads 必须是 >=1 的整数（收到 '$LOAD_THREADS'）" >&2; exit 2; }
+  if [[ "$LOAD_THREADS" -gt 1 && "$SKIP_LOAD" -eq 0 && "$ALLOW_NONEMPTY" -eq 1 ]]; then
+    echo "警告：--load-threads>1 与 --allow-nonempty 同用会按分片各自插 id，可能撞主键" >&2
+  fi
+  echo "    灌数线程数：$LOAD_THREADS（每个线程负责一段 id 分片；行长回读在最后单独跑）"
   "$SYSBENCH" "$LUA_PREPARE" "${SHAPE_ARGS[@]}" --mysql-db="$MYSQL_DB" \
-    "${load_args[@]}" --skip-ddl prepare
+    "${load_args[@]}" --threads="$LOAD_THREADS" --skip-ddl prepare
   rc=$?
-  [[ $rc -eq 0 ]] || { echo "灌数/行长回读失败（rc=${rc}）" >&2; exit $rc; }
+  [[ $rc -eq 0 ]] || { echo "灌数失败（rc=${rc}）" >&2; exit $rc; }
+  if [[ "$LOAD_THREADS" -ne 1 ]]; then
+    echo "=== 4b) 行长回读（并发灌数后单独跑一次 rowlen）==="
+    "$SYSBENCH" "$LUA_PREPARE" "${SHAPE_ARGS[@]}" --mysql-db="$MYSQL_DB" \
+      "${load_args[@]}" rowlen
+    rc=$?
+    [[ $rc -eq 0 ]] || { echo "行长回读失败（rc=${rc}）" >&2; exit $rc; }
+  fi
 fi
 
 # ── 6) 可选：跨成员核对 ─────────────────────────────────────────────────────

@@ -400,11 +400,16 @@ local function effective_batch(row_bytes)
    return b
 end
 
-local function load_table(con, db, name, shape, row_bytes)
+local function load_table(con, db, name, shape, row_bytes, first_id, last_id)
    local rng = make_rng(sysbench.opt.seed)
    local total = sysbench.opt.table_size
    local batch = effective_batch(row_bytes)
    local inserted = 0
+   -- 并发灌数：每个 worker 只负责自己那段 id（[first_id, last_id]，含两端）。
+   -- 单线程时就是 1..total，行为不变。
+   first_id = first_id or 1
+   last_id = last_id or total
+   if last_id < first_id then return 0, 0, 0 end
 
    -- 填充长度序列与目标
    local lens, target = fill_lengths((shape.fill[1] ~= nil) and shape.fill[1].target or 0,
@@ -415,11 +420,11 @@ local function load_table(con, db, name, shape, row_bytes)
       die("内部错误：shape 没有 insert_cols（列名表必须由形状给出）")
    end
 
-   while inserted < total do
+   while first_id + inserted <= last_id do
       local rows = {}
-      local n = math.min(batch, total - inserted)
+      local n = math.min(batch, last_id - (first_id + inserted) + 1)
       for i = 1, n do
-         local id = inserted + i
+         local id = first_id + inserted + i - 1
          local vals = shape.values(id, rng, lens, i)
          rows[i] = "(" .. table.concat(vals, ",") .. ")"
       end
@@ -562,7 +567,17 @@ local function cmd_prepare()
 
    local con = connect()
 
-   if not sysbench.opt.quiet_ddl then
+   -- 并发灌数走 sysbench 的 PARALLEL_COMMAND：--threads=N 起 N 个 worker，每个 worker
+   -- 用自己的连接只灌自己那段 id。判定必须在建表之前：否则每个 worker 都会去 CREATE
+   -- TABLE（1050 表已存在），而并发本来就不该由灌数线程造表。
+   local threads = tonumber(sysbench.opt.threads) or 1
+   local tid = tonumber(sysbench.tid) or 0
+   local primary = (tid % threads) == 0
+   if threads > 1 and not sysbench.opt.skip_ddl then
+      die("并发灌数要求表已存在：请带 --skip-ddl（或用 prepare.sh 的 --load-threads）")
+   end
+
+   if primary and not sysbench.opt.quiet_ddl then
       for _, name in ipairs(names) do
          print(string.format("raft_prepare.ddl=%s", table_ddl(db, name, shape.cols, shape.idx)))
       end
@@ -573,6 +588,27 @@ local function cmd_prepare()
          con:query(table_ddl(db, name, shape.cols, shape.idx))
          print(string.format("raft_prepare.created=%s", name))
       end
+   end
+
+   if threads > 1 then
+      -- 建表必须事先完成（上面已挡）；行长回读放在外层 prepare.sh 里、
+      -- 等所有 worker 结束后单独跑一次 rowlen（否则每个 worker 都会各自做一遍全表统计）。
+      local total = sysbench.opt.table_size
+      local first_id = math.floor(total * (tid % threads) / threads) + 1
+      local last_id = math.floor(total * ((tid % threads) + 1) / threads)
+      if first_id > last_id then
+         print(string.format("raft_prepare.loaded=skip shard=%d/%d id=empty", tid + 1, threads))
+         return
+      end
+      for _, name in ipairs(names) do
+         local inserted = load_table(con, db, name, shape, row_bytes, first_id, last_id)
+         print(string.format("raft_prepare.loaded=%s rows=%d shard=%d/%d id=%d..%d",
+                             name, inserted, tid + 1, threads, first_id, last_id))
+      end
+      if primary then
+         print("raft_prepare.rowlen=deferred（并发灌数：所有 worker 结束后由 prepare.sh 单独跑 rowlen）")
+      end
+      return
    end
 
    for _, name in ipairs(names) do
@@ -667,7 +703,9 @@ end
 --
 sysbench.cmdline.commands = {
    ddl = {cmd_ddl},
-   prepare = {cmd_prepare},
+   -- PARALLEL_COMMAND：--threads=N 时 sysbench 起 N 个 worker，各自调用本命令，
+   -- 每个 worker 用 sysbench.tid 取自己的 id 分片（见 cmd_prepare）。
+   prepare = {cmd_prepare, sysbench.cmdline.PARALLEL_COMMAND},
    rowlen = {cmd_rowlen},
    typescheck = {cmd_typescheck},
 }
