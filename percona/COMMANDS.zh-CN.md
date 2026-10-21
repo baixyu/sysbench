@@ -279,6 +279,14 @@ $SB src/lua/raft_monitor.lua --mysql-host=127.0.0.1 --mysql-port=$LEADER --mysql
 - journal 耐久链会按窗口输出 sync/open/write/fsync/close 的累计用时与每次 sync 均值，以及 journal writer 和 APPLIED batch 的
   records/batch 与 fsync 时间。recent_events 的各阶段分布增加 p99。并行 apply 会额外记录 slot/dependency 等待时间、worker queue
   等待时间和最大队列深度；这些数据用于解释 K=1/K>1 的差别，不表示高并行度必然更快。
+- `proposal` 仍表示 coordinator 调用 proposer 的总耗时；启用 proposal batching 时另列 `proposal_batch_wait`（adapter 等待合批），并列
+  `proposal_append_entries`（NuRaft `append_entries()` 调用）。WAL 窗口指标再拆出 writer 排队、writer I/O、数据文件 fsync 和
+  NuRaft 等待 WAL durable 的累计耗时及均值，用于判断 proposal 总耗时是否主要花在本机 WAL。`writer I/O - fsync` 是近似值，包含
+  文件打开/关闭、编码和首次建文件时的目录同步等 writer 路径工作；这些是嵌套计时，不能彼此相加。各项是成员本地计时，
+  不把跨节点延迟归到某个单一事务。
+- recent event 带服务端递增序号。`ring-watch` 会检测两次轮询之间的序号缺口，并在汇总中输出事件覆盖状态、漏失数、服务重启数和轮询错误。
+  `incomplete` 时阶段 p99 只代表已收集样本；`unknown` 表示无法证明完整（例如旧服务端没有序号，或采集中服务重启）。服务端的
+  `Percona_raft_observability_events_evicted` 是事件环累计覆盖数；事件已被 watcher 及时保存后仍可能计入覆盖数，实际采集漏失以序号缺口为准。
 - Freeze 前后客户端 p99 从 `monitor.sh` 生成的 `client-intervals.tsv` 读取。压测命令需使用 `--report-interval=1 --percentile=99`；
   汇总比较 freeze 开始前最近 5 个和结束后最早 5 个区间的 p99 中位数/最大值。手动汇总时用 `--client-file` 指定该文件。
 - **判读（verdict）**按优先级给：`UNKNOWN_OUTCOMES`（客户端拿到 3197 ⇒ 反查那几笔的 local_apply）、
@@ -286,7 +294,8 @@ $SB src/lua/raft_monitor.lua --mysql-host=127.0.0.1 --mysql-port=$LEADER --mysql
   `PERMIT_QUEUE`、`POST_COMMIT_WAIT`（ring 里 `proposal→local_apply` 空档）、`COMMIT_STALLED`（只在窗口内确实
   提交过时判）；无异常则 `NOTHING_SEEN` 并给出下一步。快照拷贝/回收推迟属于"提示项"，不算判据。
 - `--mysql-db` 随便给一个存在的库即可（采样不碰业务库；驱动默认 `sbtest`，不存在的库会连不上）。
-- **ring 的内容随角色而变**：leader 的那份才有 `proposal` / `client_delivery` / `cache_capture` 等（因此
+- **ring 的内容随角色而变**：leader 的那份才有 `proposal` / `proposal_batch_wait` / `proposal_append_entries` /
+  `client_delivery` / `cache_capture` 等（因此
   `proposal→local_apply` 空档只在 leader 上能算）；follower 的那份只有 apply 侧（`local_apply` /
   `applied_sync` / `committed_sync`）。`summarize` 会在缺阶段时明确提示这一点。
 - `max_quorum_lag` 是 **leader 侧**的量（`durable_quorum_index` 在 follower 上恒为 0）⇒ 输出里 follower

@@ -131,6 +131,13 @@ local VARS = {
    {"Percona_raft_journal_compaction_last_total_us", "g"},
    {"Percona_raft_journal_compaction_last_start_epoch_us", "g"},
    {"Percona_raft_journal_compaction_last_end_epoch_us", "g"},
+   {"Percona_raft_observability_events_evicted", "c"},
+   {"Percona_raft_wal_writer_queue_wait_us", "c"},
+   {"Percona_raft_wal_writer_io_us", "c"},
+   {"Percona_raft_wal_fsync_us", "c"},
+   {"Percona_raft_wal_fsync_calls", "c"},
+   {"Percona_raft_wal_durability_wait_us", "c"},
+   {"Percona_raft_wal_durability_wait_calls", "c"},
 }
 
 local TYPE_OF = {}
@@ -278,45 +285,120 @@ local function cmd_ring_watch()
    local con, seen = connect(), {}
    local interval = math.max(tonumber(sysbench.opt.interval_ms) or 1000, 50)
    local stop_path = sysbench.opt.out .. ".stop"
+   local last_seq, last_epoch, sequence_supported = nil, nil, true
+   local missed_events, sequence_resets, observed_events = 0, 0, 0
+   local poll_errors = 0
+   local ignore_first_gap = false
    local function identity(e)
       return table.concat({e.cluster_txn_id or "", e.stage or "", e.outcome or "", e.reason or "",
-                           e.start_us or "", e.end_us or ""}, "|")
+                           e.event_seq or e.start_us or "", e.end_us or ""}, "|")
    end
-   local function remember(snapshot, fh)
-      for _, e in ipairs(parse_ring(snapshot)) do
-         local id = identity(e)
-         if not seen[id] then
-            seen[id] = true
-            if fh then
-               local fields = {"cluster_txn_id", "stage", "outcome", "reason", "node_id", "term", "log_index",
-                               "leader_generation", "duration_us", "start_us", "end_us"}
-               local out = {}
-               for _, k in ipairs(fields) do
-                  local v = e[k]
-                  if v ~= nil then
-                     v = tostring(v):gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\n", "\\n")
-                     out[#out + 1] = string.format('"%s":"%s"', k, v)
-                  end
+   local function write_event(e, fh)
+      if fh == nil then return end
+      local fields = {"event_epoch", "event_seq", "cluster_txn_id", "stage", "outcome", "reason", "node_id", "term", "log_index",
+                      "leader_generation", "duration_us", "start_us", "end_us"}
+      local out = {}
+      for _, k in ipairs(fields) do
+         local v = e[k]
+         if v ~= nil then
+            v = tostring(v):gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\n", "\\n")
+            out[#out + 1] = string.format('"%s":"%s"', k, v)
+         end
+      end
+      fh:write("{" .. table.concat(out, ",") .. "}\n")
+   end
+   local function remember(snapshot, fh, baseline)
+      local events = parse_ring(snapshot)
+      local max_seq = nil
+      for _, e in ipairs(events) do
+         local epoch = tonumber(e.event_epoch)
+         if epoch ~= nil then
+            if last_epoch ~= nil and epoch ~= last_epoch then
+               -- The sequence is process-local; a changed epoch proves mysqld restarted,
+               -- even if the new sequence has already passed the previous value.
+               sequence_resets = sequence_resets + 1
+               last_seq = nil
+               ignore_first_gap = true
+            end
+            last_epoch = epoch
+         end
+         local seq = tonumber(e.event_seq)
+         if seq == nil then
+            sequence_supported = false
+         elseif max_seq == nil or seq > max_seq then
+            max_seq = seq
+         end
+      end
+      if sequence_supported and max_seq ~= nil then
+         if last_seq ~= nil and max_seq < last_seq then
+            -- A mysqld restart resets the process-local sequence. Coverage across
+            -- that boundary cannot be proven, but collection can continue.
+            sequence_resets = sequence_resets + 1
+            last_seq = nil
+            ignore_first_gap = true
+         end
+         for _, e in ipairs(events) do
+            local seq = tonumber(e.event_seq)
+            if seq ~= nil and (last_seq == nil or seq > last_seq) then
+               if not baseline and last_seq ~= nil and seq > last_seq + 1 then
+                  missed_events = missed_events + seq - last_seq - 1
+               elseif last_seq == nil and not baseline and not ignore_first_gap and seq > 1 then
+                  missed_events = missed_events + seq - 1
                end
-               fh:write("{" .. table.concat(out, ",") .. "}\n")
+               if not baseline then
+                  write_event(e, fh)
+                  observed_events = observed_events + 1
+               end
+               last_seq = seq
+               ignore_first_gap = false
+            end
+         end
+      else
+         -- Compatibility with servers predating event_seq. The old identity
+         -- de-duplication still collects events, while completeness is unknown.
+         for _, e in ipairs(events) do
+            local id = identity(e)
+            if not seen[id] then
+               seen[id] = true
+               if not baseline then
+                  write_event(e, fh)
+                  observed_events = observed_events + 1
+               end
             end
          end
       end
       if fh then fh:flush() end
    end
-   remember(ring_snapshot(con), nil) -- 压测前基线
+   remember(ring_snapshot(con), nil, true) -- 压测前基线
    local fh, err = io.open(sysbench.opt.out, "w")
    if fh == nil then die("写不了 %s：%s", sysbench.opt.out, tostring(err)) end
    local count = 0
    while true do
-      pcall(function() remember(ring_snapshot(con), fh) end)
+      local poll_ok = pcall(function() remember(ring_snapshot(con), fh, false) end)
+      if not poll_ok then poll_errors = poll_errors + 1 end
       count = count + 1
       local f = io.open(stop_path, "r")
-      if f then f:close(); break end
+      if f then
+         f:close()
+         local final_ok = pcall(function() remember(ring_snapshot(con), fh, false) end)
+         if not final_ok then poll_errors = poll_errors + 1 end
+         break
+      end
       pcall(function() con:query_row(string.format("SELECT SLEEP(%.3f)", interval / 1000)) end)
    end
+   local coverage_status = "unknown"
+   if sequence_supported and sequence_resets == 0 and missed_events == 0 and poll_errors == 0 then
+      coverage_status = "complete"
+   elseif sequence_supported and missed_events > 0 then
+      coverage_status = "incomplete"
+   end
+   fh:write(string.format('{"kind":"ring_coverage","status":"%s","sequence_supported":%s,"observed_events":%d,"missed_events":%d,"sequence_resets":%d,"poll_errors":%d}\n',
+                          coverage_status, sequence_supported and "true" or "false",
+                          observed_events, missed_events, sequence_resets, poll_errors))
    fh:close()
-   print(string.format("raft_monitor.ring_polls=%d out=%s", count, sysbench.opt.out))
+   print(string.format("raft_monitor.ring_polls=%d coverage=%s observed=%d missed=%d resets=%d poll_errors=%d out=%s",
+                       count, coverage_status, observed_events, missed_events,
+                       sequence_resets, poll_errors, sysbench.opt.out))
 end
 
 --
@@ -325,7 +407,7 @@ end
 
 -- 极简 ring 解析：它是 [{ "k":v, ... }, ...]，值都是标量（没有嵌套），所以按 "},{" 切开逐个取键值。
 parse_ring = function(text)
-   local events = {}
+   local events, coverage = {}, nil
    local function quoted(s, pos)
       if s:sub(pos, pos) ~= '"' then return nil, pos end
       local out, i = {}, pos + 1
@@ -366,9 +448,13 @@ parse_ring = function(text)
          end
          if value ~= nil and value ~= "null" then e[key] = value end
       end
-      if e.stage ~= nil then events[#events + 1] = e end
+      if e.stage ~= nil then
+         events[#events + 1] = e
+      elseif e.kind == "ring_coverage" then
+         coverage = e
+      end
    end
-   return events
+   return events, coverage
 end
 
 local function pct(sorted, p)
@@ -382,7 +468,7 @@ end
 local function stage_stats(events)
    local by_stage, txn, seen = {}, {}, {}
    for _, e in ipairs(events) do
-      local key = table.concat({e.cluster_txn_id or "", e.stage or "", e.outcome or "", e.reason or "",
+      local key = table.concat({e.event_epoch or "", e.event_seq or "", e.cluster_txn_id or "", e.stage or "", e.outcome or "", e.reason or "",
                                 e.start_us or "", e.end_us or ""}, "|")
       if not seen[key] then
          seen[key] = true
@@ -626,6 +712,10 @@ local function cmd_summarize()
       "Percona_raft_binlog_backfill_scanned_entries", "Percona_raft_binlog_backfill_scanned_bytes",
       "Percona_raft_binlog_derivation_prefix_losses", "Percona_raft_binlog_derivation_failures",
       "Percona_raft_wal_append_batches", "Percona_raft_wal_append_records", "Percona_raft_admission_success",
+      "Percona_raft_observability_events_evicted",
+      "Percona_raft_wal_writer_queue_wait_us", "Percona_raft_wal_writer_io_us",
+      "Percona_raft_wal_fsync_us", "Percona_raft_wal_fsync_calls",
+      "Percona_raft_wal_durability_wait_us", "Percona_raft_wal_durability_wait_calls",
       "Percona_raft_wal_snapshot_copy_calls", "Percona_raft_wal_snapshot_copy_bytes",
       "Percona_raft_durable_quorum_gate_failures",
       "Percona_raft_captured_cache_calls", "Percona_raft_envelope_sha256_calls",
@@ -672,6 +762,30 @@ local function cmd_summarize()
          tostring(applied_batches or 0),
          applied_batches and applied_batches > 0 and string.format("%.2f", (applied_records or 0) / applied_batches) or "n/a",
          (delta("Percona_raft_journal_applied_batch_fsync_us") or 0) / 1000))
+   end
+   local wal_records = delta("Percona_raft_wal_append_records")
+   local wal_batches = delta("Percona_raft_wal_append_batches")
+   local wal_queue_us = delta("Percona_raft_wal_writer_queue_wait_us")
+   local wal_io_us = delta("Percona_raft_wal_writer_io_us")
+   local wal_fsync_us = delta("Percona_raft_wal_fsync_us")
+   local wal_fsync_calls = delta("Percona_raft_wal_fsync_calls")
+   local wal_wait_us = delta("Percona_raft_wal_durability_wait_us")
+   local wal_wait_calls = delta("Percona_raft_wal_durability_wait_calls")
+   if (wal_records or wal_batches or wal_queue_us or wal_io_us or wal_fsync_us) then
+      local function mean_ms(total_us, calls)
+         if total_us == nil or calls == nil or calls <= 0 then return "n/a" end
+         return string.format("%.3f", total_us / calls / 1000)
+      end
+      local write_only_us = nil
+      if wal_io_us ~= nil and wal_fsync_us ~= nil then
+         write_only_us = math.max(0, wal_io_us - wal_fsync_us)
+      end
+      print(string.format(
+         "\n-- Raft WAL 耐久链（窗口均值）--\n  records=%s batches=%s queue/record=%sms writer-I/O/batch=%sms I/O-excl-fsync/batch≈%sms fsync/call=%sms append-durability-wait/batch=%sms",
+         tostring(wal_records or 0), tostring(wal_batches or 0),
+         mean_ms(wal_queue_us, wal_records), mean_ms(wal_io_us, wal_batches),
+         mean_ms(write_only_us, wal_batches), mean_ms(wal_fsync_us, wal_fsync_calls),
+         mean_ms(wal_wait_us, wal_wait_calls)))
    end
    local slot_waits = delta("Percona_raft_apply_slot_waits")
    local slot_wait_us = delta("Percona_raft_apply_slot_wait_us")
@@ -758,11 +872,27 @@ local function cmd_summarize()
    -- ③ ring：分阶段分布
    local gaps, deliveries = {}, {}
    if sysbench.opt.ring_file ~= "" then
-      local events = parse_ring(read_file(sysbench.opt.ring_file))
+      local events, ring_coverage = parse_ring(read_file(sysbench.opt.ring_file))
       local by_stage, g, d, txn = stage_stats(events)
       gaps, deliveries = g, d
       print(string.format("\n-- ring 分阶段（%d 条事件，%d 笔事务）--", #events, (function() local c = 0 for _ in pairs(txn) do c = c + 1 end return c end)()))
-      local stage_order = {"proposal", "proposed_sync", "committed_sync", "local_apply",
+      if ring_coverage ~= nil then
+         print(string.format("  事件覆盖：%s，已收集=%s，轮询间漏失=%s，服务重启=%s，轮询错误=%s",
+                             tostring(ring_coverage.status or "unknown"),
+                             tostring(ring_coverage.observed_events or #events),
+                             tostring(ring_coverage.missed_events or "unknown"),
+                             tostring(ring_coverage.sequence_resets or 0),
+                             tostring(ring_coverage.poll_errors or 0)))
+         if ring_coverage.status == "incomplete" then
+            print("  警告：下列分位数只代表已收集样本；recent_events 环覆盖过旧事件，p99 可能偏低或偏高。")
+         elseif ring_coverage.status == "unknown" then
+            print("  注意：当前文件无法证明阶段样本完整；用新服务端和 monitor.sh ring-watch 重新采集可获得覆盖状态。")
+         end
+      else
+         print("  事件覆盖：unknown（文件没有 ring-watch 覆盖记录）")
+      end
+      local stage_order = {"proposal", "proposal_batch_wait", "proposal_append_entries",
+                           "proposed_sync", "committed_sync", "local_apply",
                            "applied_sync", "client_delivery", "cache_capture", "admission", "prepare"}
       for _, st in ipairs(stage_order) do
          local v = by_stage[st]
