@@ -37,6 +37,7 @@
 #   --out-root=/tmp/raft-conc   产物根目录（自动按时间戳建子目录）
 #   --settle=5                  组合之间等待秒数（让集群回稳）
 #   --skip-preflight            跳过"表是否齐全/行数是否匹配"的预检
+#   --no-leader-check           不在每次跑前检查目标是不是当前 Leader（写场景否则会 3098）
 #   --mysql-cli=mysql           预检用的客户端（缺省 mysql，可用 MYSQL_CLI 覆盖）
 #   --dry-run                   只打印将执行的命令，不跑
 #   --interval-ms=500 --ring-interval-ms=250 --host-metrics --node-exporter-port=9100
@@ -59,7 +60,7 @@ SCENARIO_SPEC="ro,linro,wo,rw"
 OUT_ROOT=/tmp/raft-conc
 INTERVAL_MS=500; RING_INTERVAL_MS=250
 HOST_METRICS=0; NODE_EXPORTER_PORT=9100; PROMETHEUS_URL=
-SETTLE_S=5; DRY_RUN=0; SKIP_PREFLIGHT=0
+SETTLE_S=5; DRY_RUN=0; SKIP_PREFLIGHT=0; REQUIRE_LEADER=1
 MYSQL_CLI=${MYSQL_CLI:-mysql}
 MEMBERS=()
 
@@ -89,6 +90,7 @@ while [[ $# -gt 0 ]]; do
     --settle) SETTLE_S=$2; shift 2;;
     --mysql-cli) MYSQL_CLI=$2; shift 2;;
     --skip-preflight) SKIP_PREFLIGHT=1; shift;;
+    --no-leader-check) REQUIRE_LEADER=0; shift;;
     --dry-run) DRY_RUN=1; shift;;
     --member) MEMBERS+=("$2"); shift 2;;
     *) echo "未知参数：$1（见文件头用法）" >&2; exit 2;;
@@ -158,9 +160,9 @@ echo "    Leader：$LEADER_HOST:$LEADER_PORT  库：$DB  表：$TABLES 张 × $T
 [[ ${#MEMBERS[@]} -gt 0 ]] && echo "    监控成员：${MEMBERS[*]}"
 
 # ── 预检：表是否齐全、行数是否与 --table-size 相符 ─────────────────────
-if [[ "$SKIP_PREFLIGHT" -eq 0 ]]; then
+if [[ "$SKIP_PREFLIGHT" -eq 0 && "$DRY_RUN" -eq 0 ]]; then
   if command -v "$MYSQL_CLI" >/dev/null 2>&1; then
-    cli=("$MYSQL_CLI" -h"$LEADER_HOST" -P"$LEADER_PORT" -u"$LEADER_USER")
+    cli=("$MYSQL_CLI" --connect-timeout=5 -h"$LEADER_HOST" -P"$LEADER_PORT" -u"$LEADER_USER")
     # 密码走环境变量（只对本次调用生效、不进 argv），与工具其它脚本的口径一致
     missing=$(MYSQL_PWD="$LEADER_PASSWORD" "${cli[@]}" -Nse "
       WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<$TABLES)
@@ -175,6 +177,26 @@ if [[ "$SKIP_PREFLIGHT" -eq 0 ]]; then
       echo "  修法：先 bash percona/prepare.sh … --skip-load 补齐，或把 --tables 降到连续前缀上限。" >&2
       exit 1
     fi
+    # 写许可容量：--percona-raft-write-concurrency 是"同时持有写许可的受管事务上限"，
+    # 超过就排队 --percona-raft-write-permit-wait-us（默认 1s），排不到时服务端拒，
+    # 客户端只看到通用的 3098（ER_BEFORE_DML_VALIDATION_ERROR，"...external plugin"）。
+    PERMIT_BOUND=$(MYSQL_PWD="$LEADER_PASSWORD" "${cli[@]}" -Nse \
+      "SELECT @@percona_raft_write_concurrency" 2>/dev/null)
+    PERMIT_WAIT=$(MYSQL_PWD="$LEADER_PASSWORD" "${cli[@]}" -Nse \
+      "SELECT @@percona_raft_write_permit_wait_us" 2>/dev/null)
+    if [[ "$PERMIT_BOUND" =~ ^[0-9]+$ ]]; then
+      echo "    预检：percona-raft-write-concurrency=$PERMIT_BOUND（写许可上限），permit-wait-us=${PERMIT_WAIT:-?}"
+      for sc0 in ${SCENARIO_SPEC//,/ }; do
+        case "$sc0" in wo|rw) ;; *) continue;; esac
+        for t0 in ${THREADS//,/ }; do
+          if [[ "$t0" -gt "$PERMIT_BOUND" ]]; then
+            echo "    预检警告：$sc0 的 threads=$t0 超过写许可上限 $PERMIT_BOUND ⇒ 服务端会排队 ${PERMIT_WAIT:-?}us 后拒绝，客户端看到 3098。" >&2
+            echo "              要么把该场景的并发降到 <=$PERMIT_BOUND，要么调高服务端 --percona-raft-write-concurrency / --percona-raft-write-permit-wait-us。" >&2
+          fi
+        done
+      done
+    fi
+
     # 行数抽样（第 1 张表）：oltp 用 --table-size 算主键范围，给大了只会打空、不会报错
     cnt=$(MYSQL_PWD="$LEADER_PASSWORD" "${cli[@]}" -Nse "SELECT COUNT(*) FROM \`$DB\`.sbtest1" 2>/dev/null)
     if [[ "$cnt" =~ ^[0-9]+$ ]]; then
@@ -209,6 +231,9 @@ parse_run() { # parse_run <run-dir> -> 写一行到 stdout（TSV）
     ierr=$(grep -E '^ *ignored errors:' "$log" | tail -1 | awk '{print $3}')
     grep -q 'FATAL' "$log" && note="FATAL"
     grep -q '3197\|ER_XA_RETRY' "$log" && note="${note:+$note,}3197"
+    if grep -q '3098\|external plugin' "$log"; then
+      note="${note:+$note,}3098-permit-bound"
+    fi
   fi
   local combined
   combined=$(ls "$dir"/*-combined.txt 2>/dev/null | head -1)
@@ -260,6 +285,35 @@ for sc in ${SCENARIO_SPEC//,/ }; do
     mon+=(--out-dir="$run" --tag="${sc}-t${t}" -- "${sb_cmd[@]}")
 
     printf '%s\n' "${mon[*]}" > "$run/run.txt"
+
+    # 3098（ER_TABLE_NEEDS_REBUILD）在本 fork 里是"Raft before-DML 准入门拒绝"：
+    # 角色/服务态/binlog/协调态任一不满足就会在执行第一条 DML 时拒。跑前把这几项
+    # 记下来，失败时能立刻区分是"连错成员"还是"成员本身没在服务"。
+    if command -v "$MYSQL_CLI" >/dev/null 2>&1; then
+      MYSQL_PWD="$LEADER_PASSWORD" "$MYSQL_CLI" --connect-timeout=5 -h"$LEADER_HOST" -P"$LEADER_PORT" \
+        -u"$LEADER_USER" -Nse "
+          SELECT CONCAT_WS('|',
+            (SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME='Percona_raft_state'),
+            (SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME='Percona_raft_serving'),
+            (SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME='Percona_raft_reconciliation_required'),
+            (SELECT VARIABLE_VALUE FROM performance_schema.global_variables WHERE VARIABLE_NAME='log_bin'),
+            (SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME='Percona_raft_schema_epoch'))" \
+        > "$run/status-before.txt" 2>/dev/null
+      state_before=$(cat "$run/status-before.txt" 2>/dev/null)
+      printf 'status_before=%s (state|serving|reconciliation|log_bin|epoch)\n' "${state_before:-unknown}" >> "$run/run.txt"
+      if [[ "$REQUIRE_LEADER" -eq 1 && "$DRY_RUN" -eq 0 ]]; then
+        case "$state_before" in
+          LEADER*)
+            if [[ "$state_before" == *"|OFF|"* ]]; then
+              echo "     警告：$LEADER_HOST:$LEADER_PORT 是 LEADER 但 serving=OFF（$state_before）" >&2
+            fi;;
+          ""|unknown) echo "     警告：读不到 $LEADER_HOST:$LEADER_PORT 的角色/服务态，继续" >&2;;
+          *)
+            echo "     警告：$LEADER_HOST:$LEADER_PORT 当前不是 LEADER（$state_before）；写场景会 3098。" >&2
+            echo "           用 SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME='Percona_raft_state' 找当前 Leader。" >&2;;
+        esac
+      fi
+    fi
     echo "   ▶ $sc threads=$t → $run"
     if [[ "$DRY_RUN" -eq 1 ]]; then
       echo "     (dry-run) ${mon[*]}"
@@ -270,7 +324,28 @@ for sc in ${SCENARIO_SPEC//,/ }; do
       rc=$?
       printf 'rc=%d elapsed_s=%d\n' "$rc" "$(( $(date +%s) - started ))" >> "$run/run.txt"
     fi
-    [[ $rc -ne 0 ]] && overall_rc=1
+    if [[ $rc -ne 0 ]]; then
+      overall_rc=1
+      if command -v "$MYSQL_CLI" >/dev/null 2>&1 && [[ "$DRY_RUN" -eq 0 ]]; then
+        MYSQL_PWD="$LEADER_PASSWORD" "$MYSQL_CLI" --connect-timeout=5 -h"$LEADER_HOST" -P"$LEADER_PORT" \
+          -u"$LEADER_USER" -e "SHOW GLOBAL STATUS LIKE 'Percona_raft_%'" \
+          > "$run/status-after.txt" 2>/dev/null
+      fi
+      {
+        echo
+        echo "# rc=$rc"
+        echo "# 若 command.log 里是 3098 'The table does not comply with the requirements by an external plugin.'："
+        echo "#   那是 Raft before-DML 准入门拒绝，真正原因在 **服务端错误日志**（不是客户端）："
+        echo "#   grep -n 'first-DML admission refused' <leader 的 error.log> | tail"
+        echo "#   3098 = ER_BEFORE_DML_VALIDATION_ERROR（这个 fork 的 before-DML 校验，不是数据问题）："
+        echo "#     最常见的直接原因是写许可上限 --percona-raft-write-concurrency（同时持有写许可的事务数）"
+        echo "#     被 --threads 超过，排队 --percona-raft-write-permit-wait-us 后仍拿不到 ⇒ 拒绝。"
+        echo "#     看 Percona_raft_write_permit_waits / write_permit_wait_timeouts 的增量即可确认。"
+        echo "#   常见：no fresh write-quorum proof (not Leader, or peers stale) / write permit unavailable (bound reached …)"
+        echo "#         local apply cursor is behind the committed prefix / 该成员没有 binlog"
+        echo "#   对应调参：--percona-raft-write-permit-wait-us、admission 上限；或把并发降下来重试。"
+      } >> "$run/run.txt"
+    fi
     row=$(parse_run "$run")
     if [[ "$DRY_RUN" -eq 1 ]]; then
       row=$(printf 'n/a\tn/a\tn/a\tn/a\tn/a\tn/a\tn/a\tn/a\tn/a\tn/a\tdry-run')
