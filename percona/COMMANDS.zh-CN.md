@@ -427,6 +427,31 @@ bash percona/prepare.sh --sysbench=$SB --schema-db=$DB --mysql-db=$DB \
 
 ---
 
+## 5.5 并发矩阵：`percona/concurrency_matrix.sh`
+
+一条命令把"场景 × 并发梯度"跑成矩阵，每次组合都用 `monitor.sh` 包住，原始数据与结果分开落盘：
+
+```bash
+bash percona/concurrency_matrix.sh \
+  --sysbench=$SB --leader-host=$LEADER --leader-port=6606 \
+  --leader-user=root --leader-password=root \
+  --member 10.188.62.79:6606 --member 10.214.38.209:6606 --member 10.188.48.140:6606 \
+  --mysql-db=$DB --tables=64 --table-size=200000 \
+  --threads=4-128:2 --time=60 --scenarios=ro,linro,wo,rw \
+  --host-metrics --node-exporter-port=9100 \
+  --out-root=/tmp/raft-conc
+```
+
+- 场景：`ro`（点查）/ `linro`（点查 LINEARIZABLE 强读）/ `wo`（只写）/ `rw`（读写混合）；
+- 并发梯度：`4,8,16,32,64,128` 或 `4-128:2`（两端含、按倍率展开）；
+- 产物（`--out-root/<时间戳>/`）：`matrix.tsv` / `matrix.md`（全矩阵），
+  `<scenario>/<scenario>-summary.tsv`（单场景梯度），`<scenario>/t<NNN>/`（该组合的全部 monitor 原始数据 + `command.log` + `run.txt`）；
+- 每行指标：tps / qps / lat_avg / p95 / p99 / max / ignored_errors / leader 的
+  `unknown_delta` / `max_apply_lag` / `post_commit_gap_p95_us`，以及 `note`（`FATAL`、`3197`）；
+- **预检**：先查 `sbtest1..--tables` 是否齐全（缺表会直接拒绝，因为 oltp 脚本按 1..N 逐表 prepare），
+  并抽样核对 `sbtest1` 的行数与 `--table-size`；拿不到 mysql 客户端时只告警不阻断（`--skip-preflight` 可跳过）；
+- `--dry-run` 只打印将执行的命令，适合先确认参数。
+
 ## 6. 验收命令集
 
 ### 6.1 M1 收尾（Linux 上的正式口径，leader 直跑）
