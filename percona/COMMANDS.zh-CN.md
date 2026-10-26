@@ -446,7 +446,7 @@ bash percona/concurrency_matrix.sh \
 - 并发梯度：`4,8,16,32,64,128` 或 `4-128:2`（两端含、按倍率展开）；
 - 产物（`--out-root/<时间戳>/`）：`matrix.tsv` / `matrix.md`（全矩阵），
   `<scenario>/<scenario>-summary.tsv`（单场景梯度），`<scenario>/t<NNN>/`（该组合的全部 monitor 原始数据 + `command.log` + `run.txt`）；
-- 每行指标：tps / qps / lat_avg / p95 / p99 / max / ignored_errors / leader 的
+- 每行指标：**qps（queries/s）/ tps（transactions/s）/ q-txn（每事务语句数，1/6/20 可用来核对口径）** / lat_avg / p95 / p99 / max / ignored_errors / leader 的
   `unknown_delta` / `max_apply_lag` / `post_commit_gap_p95_us`，以及 `note`（`FATAL`、`3197`）；
 - **预检**：先查 `sbtest1..--tables` 是否齐全（缺表会直接拒绝，因为 oltp 脚本按 1..N 逐表 prepare），
   并抽样核对 `sbtest1` 的行数与 `--table-size`；拿不到 mysql 客户端时只告警不阻断（`--skip-preflight` 可跳过）；

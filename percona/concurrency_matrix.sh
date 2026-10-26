@@ -261,12 +261,18 @@ parse_run() { # parse_run <run-dir> -> 写一行到 stdout（TSV）
     al=$(sed -E 's/.*max_apply_lag=([^ ]+).*/\1/' <<<"$leader")
     gap=$(sed -E 's/.*post_commit_gap_p95_us=([^ ]+).*/\1/' <<<"$leader")
   fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "${tps:-n/a}" "${qps:-n/a}" "${lavg:-n/a}" "${lp95:-n/a}" "${lp99:-n/a}" "${lmax:-n/a}" \
+  # queries/transaction：QPS 与 TPS 的比值 = 每事务语句数（只读/强读 1、只写 6、读写 20），
+  # 用来一眼看出"读到的 QPS 是不是同口径"，也便于和 sysbench 场景对照。
+  local qpt="n/a"
+  if [[ -n "$tps" && -n "$qps" ]] && awk -v a="$tps" 'BEGIN{exit !(a+0>0)}'; then
+    qpt=$(awk -v q="$qps" -v t="$tps" 'BEGIN{printf "%.2f", q/t}')
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "${tps:-n/a}" "${qps:-n/a}" "$qpt" "${lavg:-n/a}" "${lp95:-n/a}" "${lp99:-n/a}" "${lmax:-n/a}" \
     "${ierr:-n/a}" "${ud:-n/a}" "${al:-n/a}" "${gap:-n/a}" "${note:-ok}"
 }
 
-HDR='scenario\tthreads\ttps\tqps\tlat_avg_ms\tlat_p95_ms\tlat_p99_ms\tlat_max_ms\tignored_errors\tunknown_delta\tmax_apply_lag\tpost_commit_gap_p95_us\tnote'
+HDR='scenario\tthreads\ttps_trans_per_s\tqps_queries_per_s\tqueries_per_txn\tlat_avg_ms\tlat_p95_ms\tlat_p99_ms\tlat_max_ms\tignored_errors\tunknown_delta\tmax_apply_lag\tpost_commit_gap_p95_us\tnote'
 printf '%b\n' "$HDR" > "$ROOT/matrix.tsv"
 
 overall_rc=0
@@ -381,7 +387,7 @@ for sc in ${SCENARIO_SPEC//,/ }; do
     fi
     printf '%s\t%s\t%s\n' "$sc" "$t" "$row" >> "$scdir/$sc-summary.tsv"
     printf '%s\t%s\t%s\n' "$sc" "$t" "$row" >> "$ROOT/matrix.tsv"
-    echo "     rc=$rc  $(cut -f1-4 <<<"$row" | tr '\t' ' ')"
+    echo "     rc=$rc  $(awk -F'\t' '{printf "QPS=%s TPS=%s q/txn=%s", $1, $2, $3}' <<<"$row")"
     if [[ "$first" -eq 1 ]]; then first=0; else
       [[ "$DRY_RUN" -eq 0 && "$SETTLE_S" -gt 0 ]] && { echo "     settle ${SETTLE_S}s…"; sleep "$SETTLE_S"; }
     fi
@@ -395,9 +401,9 @@ done
   echo "- Leader：$LEADER_HOST:$LEADER_PORT  库：$DB  表：$TABLES × $TABLE_SIZE 行"
   echo "- 每组合 ${TIME_S}s；并发：${THREADS}；产物：$ROOT"
   echo
-  echo "| 场景 | 并发 | tps | qps | lat_avg | p95 | p99 | lat_max | err | unknown | apply_lag | gap_p95_us |"
-  echo "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
-  awk -F'\t' 'NR>1 && $1!="scenario" {printf "| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13}' "$ROOT/matrix.tsv"
+  echo "| 场景 | 并发 | QPS(queries/s) | TPS(trans/s) | q/txn | lat_avg | p95 | p99 | lat_max | err | unknown | apply_lag | gap_p95_us |"
+  echo "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+  awk -F'\t' 'NR>1 && $1!="scenario" {printf "| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", $1,$2,$4,$3,$5,$6,$7,$8,$9,$10,$11,$12,$13}' "$ROOT/matrix.tsv"
 } > "$ROOT/matrix.md"
 
 echo
