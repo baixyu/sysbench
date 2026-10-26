@@ -60,6 +60,10 @@ local VARS = {
    {"Percona_raft_admission_hold_timeouts", "c"}, {"Percona_raft_caught_up_waits", "c"},
    {"Percona_raft_caught_up_wait_us", "c"}, {"Percona_raft_caught_up_real_lag", "g"},
    {"Percona_raft_catchup_stall", "s"},
+   -- G-4 强读：确认轮成功/回退与耗时。强读延迟 ≈ 心跳周期的 1/2~1 倍（确认必须发生在读发起之后），
+   -- 这几个数能把"确认成功"和"回退到 barrier append"分开。
+   {"Percona_raft_read_index_confirmations", "c"}, {"Percona_raft_read_index_fallbacks", "c"},
+   {"Percona_raft_read_index_confirm_us", "c"}, {"Percona_raft_read_index_confirm_max_us", "g"},
    -- 结果未定
    {"Percona_raft_client_delivery_unknown", "c"}, {"Percona_raft_client_proposal_uncertain", "c"},
    {"Percona_raft_proposal_uncertain", "c"}, {"Percona_raft_proposal_unknown", "c"},
@@ -694,6 +698,8 @@ local function cmd_summarize()
       "Percona_raft_write_permit_waits", "Percona_raft_write_permit_wait_us",
       "Percona_raft_admission_hold_timeouts", "Percona_raft_caught_up_waits",
       "Percona_raft_caught_up_wait_us",
+      "Percona_raft_read_index_confirmations", "Percona_raft_read_index_fallbacks",
+      "Percona_raft_read_index_confirm_us",
       "Percona_raft_client_delivery_unknown", "Percona_raft_client_proposal_uncertain",
       "Percona_raft_proposal_uncertain", "Percona_raft_proposal_unknown",
       "Percona_raft_client_apply_failed_unknown", "Percona_raft_client_wait_timeout",
