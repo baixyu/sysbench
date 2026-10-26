@@ -184,8 +184,22 @@ if [[ "$SKIP_PREFLIGHT" -eq 0 && "$DRY_RUN" -eq 0 ]]; then
       "SELECT @@percona_raft_write_concurrency" 2>/dev/null)
     PERMIT_WAIT=$(MYSQL_PWD="$LEADER_PASSWORD" "${cli[@]}" -Nse \
       "SELECT @@percona_raft_write_permit_wait_us" 2>/dev/null)
+    APPLY_CONC=$(MYSQL_PWD="$LEADER_PASSWORD" "${cli[@]}" -Nse \
+      "SELECT @@percona_raft_apply_concurrency" 2>/dev/null)
+    APPLY_WORKERS=$(MYSQL_PWD="$LEADER_PASSWORD" "${cli[@]}" -Nse \
+      "SELECT @@percona_raft_apply_workers" 2>/dev/null)
+    CAUGHT_WAIT=$(MYSQL_PWD="$LEADER_PASSWORD" "${cli[@]}" -Nse \
+      "SELECT @@percona_raft_caught_up_wait_us" 2>/dev/null)
     if [[ "$PERMIT_BOUND" =~ ^[0-9]+$ ]]; then
-      echo "    预检：percona-raft-write-concurrency=$PERMIT_BOUND（写许可上限），permit-wait-us=${PERMIT_WAIT:-?}"
+      echo "    预检：write-concurrency=$PERMIT_BOUND（合法范围 1..64）permit-wait-us=${PERMIT_WAIT:-?}"
+      echo "    预检：apply-concurrency=$APPLY_CONC apply-workers=${APPLY_WORKERS:-0}(跟随) caught-up-wait-us=${CAUGHT_WAIT:-?}"
+      # apply_concurrency=1 ⇒ applier 一次只有一个 committed entry 在飞；写许可远大于 apply 能力时，
+      # first-DML 与 final commit 的"applied==committed"等待会超时：客户端看到 3098 / 1402。
+      if [[ "$APPLY_CONC" =~ ^[0-9]+$ && "$APPLY_CONC" -le 1 ]]; then
+        echo "    预检警告：apply-concurrency=$APPLY_CONC ⇒ apply 是串行的；写场景并发一上来，" >&2
+        echo "              3098（first-DML 等 applied==committed 超时）/1402（COMMIT fence 超时）就会成为容量边界。" >&2
+        echo "              建议 --percona-raft-apply-concurrency=8..32（workers 跟随或 >= 它），并把 caught-up-wait-us 调到 1-2s。" >&2
+      fi
       for sc0 in ${SCENARIO_SPEC//,/ }; do
         case "$sc0" in wo|rw) ;; *) continue;; esac
         for t0 in ${THREADS//,/ }; do
