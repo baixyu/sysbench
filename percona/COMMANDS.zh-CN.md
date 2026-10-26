@@ -270,9 +270,15 @@ $SB src/lua/raft_monitor.lua --mysql-host=127.0.0.1 --mysql-port=$LEADER --mysql
   本机日志（journal_write_us / fsync_us / applied_batch_fsync_us / scan_us / WAL append batches 与 records）、
   binlog 派生与 backfill 进度、引擎 apply（apply_count / apply_engine_us / slow_applies）、冻结与快照
   （freeze_* / binlog_freeze_deferrals / wal_snapshot_copy_*）、捕获编码（captured_cache / envelope_sha256）、
-  MySQL 侧旁证（Threads_running / InnoDB 行读写 / buffer pool / fsync / 数据字节 / Queries）。汇总会给出
-  queries（含 monitor 自身查询）、WAL、行读写、数据字节和 fsync 的每秒速率、WAL 平均 records/batch 及 buffer pool 命中率。
-  **缺的状态量留空，不编 0**。
+  MySQL 侧旁证（Threads_running / InnoDB 行读写、行锁等待、deadlock、redo fsync / buffer pool / 数据字节 / Queries）。
+  **并发写服务端诊断**还包括写许可等待/超时、caught-up 拒绝、prepare/proposed/committed 成功及失败、
+  WAL batch 超时/完成通知、当前 active managed contexts、apply 调度状态和 peer 匹配位点。
+  汇总会给出 SQL 写命令、Raft 准入/提交、WAL、行读写、数据字节和 fsync 的每秒速率；
+  **COMMITTED journal** 单独输出 mutex / compaction / prepare / encode / writer queue / write / fsync / publish 每次 sync 均值。
+  缺的状态量留空，不编 0。
+- `apply_stage_breakdown`、`receipt_lookup_breakdown`、`envelope_hash_breakdown`、`apply_schedule_state` 和 `peer_raft_state`
+  等服务端字符串状态也会保存在 TSV；汇总打印首末值。结合 `ring-watch` 中的 proposal、quorum、handoff、callback、worker queue 和 apply 分段，
+  可以区分客户端并发上升后是准入排队、proposal/WAL 耐久、COMMITTED journal、InnoDB 行锁还是 applier 调度在限制吞吐。
 - 新增的 freeze 折叠读数会记录成功次数、折叠前全 journal 扫描与发布后 reload 校验的累计字节数/耗时、重写 journal 与 tombstone segment 的字节数/耗时，
   并保存最近一次 freeze 的开始/结束 epoch 时间和总耗时。汇总按采样观察到的每次计数变化列明细；如果一个采样间隔内发生多次，
   累计次数准确，`last-*` 只能给出最近一次的明细，此时缩短 `--interval-ms`。完整性扫描仍覆盖整个 journal，不跳过校验。

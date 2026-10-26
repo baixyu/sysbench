@@ -60,10 +60,21 @@ local VARS = {
    {"Percona_raft_admission_hold_timeouts", "c"}, {"Percona_raft_caught_up_waits", "c"},
    {"Percona_raft_caught_up_wait_us", "c"}, {"Percona_raft_caught_up_real_lag", "g"},
    {"Percona_raft_catchup_stall", "s"},
-   -- G-4 强读：确认轮成功/回退与耗时。强读延迟 ≈ 心跳周期的 1/2~1 倍（确认必须发生在读发起之后），
-   -- 这几个数能把"确认成功"和"回退到 barrier append"分开。
+   -- G-4 强读：请求相关的 ReadIndex 探测。总耗时拆为派发、等待响应、本地确认与 apply 等待；
+   -- 正常路径应约为多数派探测 RTT，fallback 才会追加 barrier。
    {"Percona_raft_read_index_confirmations", "c"}, {"Percona_raft_read_index_fallbacks", "c"},
    {"Percona_raft_read_index_confirm_us", "c"}, {"Percona_raft_read_index_confirm_max_us", "g"},
+   {"Percona_raft_read_index_probe_rounds", "c"},
+   {"Percona_raft_read_index_rpc_pool_saturations", "c"},
+   {"Percona_raft_read_index_probe_dispatch_us", "c"},
+   {"Percona_raft_read_index_probe_dispatch_max_us", "g"},
+   {"Percona_raft_read_index_response_wait_us", "c"},
+   {"Percona_raft_read_index_response_wait_max_us", "g"},
+   {"Percona_raft_read_index_local_confirm_us", "c"},
+   {"Percona_raft_read_index_local_confirm_max_us", "g"},
+   {"Percona_raft_read_apply_wait_samples", "c"},
+   {"Percona_raft_read_apply_wait_us", "c"},
+   {"Percona_raft_read_apply_wait_max_us", "g"},
    -- 结果未定
    {"Percona_raft_client_delivery_unknown", "c"}, {"Percona_raft_client_proposal_uncertain", "c"},
    {"Percona_raft_proposal_uncertain", "c"}, {"Percona_raft_proposal_unknown", "c"},
@@ -113,7 +124,7 @@ local VARS = {
    {"Percona_raft_journal_sync_calls", "c"}, {"Percona_raft_journal_sync_us", "c"},
    {"Percona_raft_journal_open_us", "c"},
    {"Percona_raft_journal_close_us", "c"}, {"Percona_raft_journal_dir_sync_us", "c"},
-   {"Percona_raft_journal_batches", "c"}, {"Percona_raft_journal_batch_fsync_us", "c"},
+   {"Percona_raft_journal_batch_fsync_us", "c"},
    {"Percona_raft_journal_batch_records", "c"},
    {"Percona_raft_journal_applied_batch_records", "c"},
    {"Percona_raft_apply_slot_waits", "c"}, {"Percona_raft_apply_slot_wait_us", "c"},
@@ -142,6 +153,114 @@ local VARS = {
    {"Percona_raft_wal_fsync_calls", "c"},
    {"Percona_raft_wal_durability_wait_us", "c"},
    {"Percona_raft_wal_durability_wait_calls", "c"},
+   -- 并发写服务端诊断：准入、受管提交结果、WAL 完成唤醒与 COMMITTED journal 耐久链。
+   {"Percona_raft_write_permit_wait_timeouts", "c"},
+   {"Percona_raft_admission_permit_holder", "s"},
+   {"Percona_raft_caught_up", "s"},
+   {"Percona_raft_caught_up_refusals", "c"},
+   {"Percona_raft_caught_up_not_serving", "c"},
+   {"Percona_raft_caught_up_max_lag", "g"},
+   {"Percona_raft_caught_up_publication_lag", "c"},
+   {"Percona_raft_prepare_success", "c"},
+   {"Percona_raft_proposed_sync_success", "c"},
+   {"Percona_raft_committed_sync_success", "c"},
+   {"Percona_raft_committed_sync_journal_failed", "c"},
+   {"Percona_raft_managed_active_contexts", "g"},
+   {"Percona_raft_managed_begin_calls", "c"},
+   {"Percona_raft_managed_commit_requested_calls", "c"},
+   {"Percona_raft_managed_rollback_requested_calls", "c"},
+   {"Percona_raft_managed_empty_transactions", "c"},
+   {"Percona_raft_managed_dml_candidate_calls", "c"},
+   {"Percona_raft_wal_batch_wait_timeouts", "c"},
+   {"Percona_raft_wal_completion_notifications", "c"},
+   {"Percona_raft_wal_completion_notifier_detaches", "c"},
+   {"Percona_raft_journal_committed_sync_calls", "c"},
+   {"Percona_raft_journal_committed_sync_us", "c"},
+   {"Percona_raft_journal_committed_mutex_wait_us", "c"},
+   {"Percona_raft_journal_committed_compaction_wait_us", "c"},
+   {"Percona_raft_journal_committed_prepare_us", "c"},
+   {"Percona_raft_journal_committed_encode_us", "c"},
+   {"Percona_raft_journal_committed_writer_wait_us", "c"},
+   {"Percona_raft_journal_committed_write_us", "c"},
+   {"Percona_raft_journal_committed_fsync_us", "c"},
+   {"Percona_raft_journal_committed_publish_us", "c"},
+   {"Percona_raft_apply_schedule_state", "s"},
+   {"Percona_raft_apply_stage_breakdown", "s"},
+   {"Percona_raft_receipt_lookup_breakdown", "s"},
+   {"Percona_raft_envelope_hash_breakdown", "s"},
+   {"Percona_raft_peer_raft_state", "s"},
+   {"Percona_raft_configuration", "s"},
+   {"Percona_raft_raft_status_calls", "c"},
+   {"Percona_raft_raft_status_us", "c"},
+   {"Percona_raft_raft_status_max_us", "g"},
+   {"Percona_raft_raft_status_sites", "s"},
+   {"Percona_raft_observability_records", "c"},
+   {"Percona_raft_journal_segment_count", "g"},
+   {"Percona_raft_journal_active_segment_bytes", "g"},
+   {"Percona_raft_journal_segment_rollovers_total", "c"},
+   {"Percona_raft_journal_manifest_generation", "g"},
+   {"Percona_raft_journal_compaction_source_files", "g"},
+   {"Percona_raft_journal_compaction_last_entry_wait_us", "g"},
+   {"Percona_raft_journal_compaction_last_initial_drain_us", "g"},
+   {"Percona_raft_journal_compaction_last_fold_us", "g"},
+   {"Percona_raft_journal_compaction_last_staging_write_us", "g"},
+   {"Percona_raft_journal_compaction_last_staging_fsync_us", "g"},
+   {"Percona_raft_journal_compaction_last_tail_us", "g"},
+   {"Percona_raft_journal_compaction_last_tail_scan_us", "g"},
+   {"Percona_raft_journal_compaction_last_validation_us", "g"},
+   {"Percona_raft_journal_compaction_last_publish_lock_wait_us", "g"},
+   {"Percona_raft_journal_compaction_last_publish_boundary_wait_us", "g"},
+   {"Percona_raft_journal_compaction_last_publish_lock_hold_us", "g"},
+   {"Percona_raft_journal_compaction_last_publish_link_us", "g"},
+   {"Percona_raft_journal_compaction_last_descriptor_invalidate_us", "g"},
+   {"Percona_raft_journal_compaction_last_publish_rename_us", "g"},
+   {"Percona_raft_journal_compaction_last_publish_dir_sync_us", "g"},
+   {"Percona_raft_journal_compaction_last_mirror_swap_us", "g"},
+   {"Percona_raft_committed_prefix_refetch_required", "g"},
+   {"Percona_raft_committed_prefix_refetch_floor", "g"},
+   {"Percona_raft_binlog_sync_requests", "c"},
+   {"Percona_raft_binlog_synced_through_index", "g"},
+   {"Percona_raft_freeze_failures", "c"},
+   {"Percona_raft_freeze_snapshot_successes", "c"},
+   {"Percona_raft_compaction_head_bytes", "g"},
+   {"Percona_raft_tombstones_retained", "g"},
+   {"Percona_raft_tombstones_dropped_total", "c"},
+   {"Percona_raft_tombstone_window_shortened_total", "c"},
+   {"Percona_raft_tombstone_window_ms", "g"},
+   {"Percona_raft_reclaim_published_index", "g"},
+   {"Percona_raft_reclaim_pending_index", "g"},
+   {"Percona_raft_local_reclaim_folds", "c"},
+   {"Percona_raft_local_reclaim_failures", "c"},
+   {"Percona_raft_local_log_truncations", "c"},
+   {"Percona_raft_capture_epoch_mismatches", "c"},
+   {"Percona_raft_framed_cache_calls", "c"},
+   {"Percona_raft_framed_cache_events", "c"},
+   {"Percona_raft_invalid_cache_frame_calls", "c"},
+   {"Percona_raft_metadata_write_rejections", "c"},
+   {"Percona_raft_dml_target_rejections", "c"},
+   {"Percona_raft_unmanaged_write_rejections", "c"},
+   {"Percona_raft_pre_prepare_rollback_failures", "c"},
+   {"Percona_raft_profile_gtid_rejections", "c"},
+   {"Percona_raft_metadata_statements_skipped_on_proposer", "c"},
+   {"Percona_raft_dml_extension_admitted_insert_select", "c"},
+   {"Percona_raft_dml_extension_admitted_multi_table", "c"},
+   {"Percona_raft_dml_extension_admitted_replace", "c"},
+   {"Percona_raft_dml_extension_admitted_upsert", "c"},
+   {"Percona_raft_observability_recent_events", "g"},
+   {"Percona_raft_last_serving_gap_ms", "g"},
+   {"Percona_raft_serving_gap_open_ms", "g"},
+   {"Percona_raft_no_leader_contact_seconds", "g"},
+   {"Percona_raft_last_capture_epoch", "g"},
+   {"Percona_raft_reconcile_round_failures", "c"},
+   {"Percona_raft_reconcile_missing_members", "s"},
+   {"Percona_raft_reconcile_entry_watermark", "g"},
+   -- InnoDB 锁竞争与 SQL 写命令旁证，和 Raft 准入/耐久等待分开看。
+   {"Innodb_row_lock_waits", "c"}, {"Innodb_row_lock_time", "c"},
+   {"Innodb_deadlocks", "c"}, {"Innodb_os_log_fsyncs", "c"},
+   {"Innodb_data_pending_fsyncs", "g"}, {"Innodb_data_pending_writes", "g"},
+   {"Innodb_os_log_pending_fsyncs", "g"},
+   {"Com_insert", "c"}, {"Com_update", "c"}, {"Com_delete", "c"},
+   {"Com_commit", "c"}, {"Com_rollback", "c"},
 }
 
 local TYPE_OF = {}
@@ -696,10 +815,47 @@ local function cmd_summarize()
       "Percona_raft_apply_dependency_wait_samples",
       "Percona_raft_apply_worker_queue_wait_samples", "Percona_raft_apply_worker_queue_wait_us",
       "Percona_raft_write_permit_waits", "Percona_raft_write_permit_wait_us",
+      "Percona_raft_write_permit_wait_timeouts",
       "Percona_raft_admission_hold_timeouts", "Percona_raft_caught_up_waits",
-      "Percona_raft_caught_up_wait_us",
+      "Percona_raft_caught_up_wait_us", "Percona_raft_caught_up_refusals",
+      "Percona_raft_caught_up_not_serving", "Percona_raft_caught_up_publication_lag",
+      "Percona_raft_prepare_success", "Percona_raft_proposed_sync_success",
+      "Percona_raft_committed_sync_success", "Percona_raft_committed_sync_journal_failed",
+      "Percona_raft_managed_begin_calls", "Percona_raft_managed_commit_requested_calls",
+      "Percona_raft_managed_rollback_requested_calls", "Percona_raft_managed_empty_transactions",
+      "Percona_raft_managed_dml_candidate_calls",
+      "Percona_raft_wal_batch_wait_timeouts", "Percona_raft_wal_completion_notifications",
+      "Percona_raft_wal_completion_notifier_detaches",
+      "Percona_raft_journal_committed_sync_calls", "Percona_raft_journal_committed_sync_us",
+      "Percona_raft_journal_committed_mutex_wait_us",
+      "Percona_raft_journal_committed_compaction_wait_us",
+      "Percona_raft_journal_committed_prepare_us", "Percona_raft_journal_committed_encode_us",
+      "Percona_raft_journal_committed_writer_wait_us", "Percona_raft_journal_committed_write_us",
+      "Percona_raft_journal_committed_fsync_us", "Percona_raft_journal_committed_publish_us",
+      "Percona_raft_raft_status_calls", "Percona_raft_raft_status_us",
+      "Percona_raft_observability_records", "Percona_raft_journal_segment_rollovers_total",
+      "Percona_raft_binlog_sync_requests", "Percona_raft_freeze_failures",
+      "Percona_raft_freeze_snapshot_successes", "Percona_raft_tombstones_dropped_total",
+      "Percona_raft_tombstone_window_shortened_total", "Percona_raft_local_reclaim_folds",
+      "Percona_raft_local_reclaim_failures", "Percona_raft_local_log_truncations",
+      "Percona_raft_capture_epoch_mismatches", "Percona_raft_framed_cache_calls",
+      "Percona_raft_framed_cache_events", "Percona_raft_invalid_cache_frame_calls",
+      "Percona_raft_metadata_write_rejections", "Percona_raft_dml_target_rejections",
+      "Percona_raft_unmanaged_write_rejections", "Percona_raft_pre_prepare_rollback_failures",
+      "Percona_raft_profile_gtid_rejections", "Percona_raft_metadata_statements_skipped_on_proposer",
+      "Percona_raft_dml_extension_admitted_insert_select",
+      "Percona_raft_dml_extension_admitted_multi_table",
+      "Percona_raft_dml_extension_admitted_replace", "Percona_raft_dml_extension_admitted_upsert",
+      "Percona_raft_reconcile_round_failures",
       "Percona_raft_read_index_confirmations", "Percona_raft_read_index_fallbacks",
       "Percona_raft_read_index_confirm_us",
+      "Percona_raft_read_index_probe_rounds",
+      "Percona_raft_read_index_rpc_pool_saturations",
+      "Percona_raft_read_index_probe_dispatch_us",
+      "Percona_raft_read_index_response_wait_us",
+      "Percona_raft_read_index_local_confirm_us",
+      "Percona_raft_read_apply_wait_samples",
+      "Percona_raft_read_apply_wait_us",
       "Percona_raft_client_delivery_unknown", "Percona_raft_client_proposal_uncertain",
       "Percona_raft_proposal_uncertain", "Percona_raft_proposal_unknown",
       "Percona_raft_client_apply_failed_unknown", "Percona_raft_client_wait_timeout",
@@ -729,7 +885,9 @@ local function cmd_summarize()
       "Percona_raft_wal_snapshot_copy_calls", "Percona_raft_wal_snapshot_copy_bytes",
       "Percona_raft_durable_quorum_gate_failures",
       "Percona_raft_captured_cache_calls", "Percona_raft_envelope_sha256_calls",
-      "Innodb_data_fsyncs", "Innodb_os_log_written", "Innodb_log_waits",
+      "Innodb_data_fsyncs", "Innodb_os_log_fsyncs", "Innodb_os_log_written", "Innodb_log_waits",
+      "Innodb_row_lock_waits", "Innodb_row_lock_time", "Innodb_deadlocks",
+      "Com_insert", "Com_update", "Com_delete", "Com_commit", "Com_rollback",
       "Innodb_rows_inserted", "Innodb_rows_updated", "Innodb_rows_deleted", "Innodb_rows_read",
       "Innodb_data_read", "Innodb_data_written",
    }
@@ -742,6 +900,30 @@ local function cmd_summarize()
          local extra = mv > 0 and string.format("  [回退 %d 次！]", mv) or ""
          print(string.format("  %-52s %+d%s", nm, d, extra))
       end
+   end
+
+   local permit_waits = delta("Percona_raft_write_permit_waits")
+   local permit_wait_us = delta("Percona_raft_write_permit_wait_us")
+   local permit_timeouts = delta("Percona_raft_write_permit_wait_timeouts")
+   local caught_up_waits = delta("Percona_raft_caught_up_waits")
+   local caught_up_wait_us = delta("Percona_raft_caught_up_wait_us")
+   if (permit_waits or permit_timeouts or caught_up_waits) then
+      local permit_mean = permit_waits and permit_waits > 0 and
+         string.format("%.3fms", (permit_wait_us or 0) / permit_waits / 1000) or "n/a"
+      local caught_up_mean = caught_up_waits and caught_up_waits > 0 and
+         string.format("%.3fms", (caught_up_wait_us or 0) / caught_up_waits / 1000) or "n/a"
+      print(string.format(
+         "\n-- 写入准入等待 --\n  permit waits=%s mean=%s timeouts=%s; caught_up waits=%s mean=%s refusals=%s not_serving=%s",
+         tostring(permit_waits or 0), permit_mean, tostring(permit_timeouts or 0),
+         tostring(caught_up_waits or 0), caught_up_mean,
+         tostring(delta("Percona_raft_caught_up_refusals") or 0),
+         tostring(delta("Percona_raft_caught_up_not_serving") or 0)))
+   end
+   local status_calls = delta("Percona_raft_raft_status_calls")
+   local status_us = delta("Percona_raft_raft_status_us")
+   if status_calls and status_calls > 0 and status_us then
+      print(string.format("  raft status snapshots=%d mean=%.3fms/call (cumulative timer; nested call sites may overlap)",
+         status_calls, status_us / status_calls / 1000))
    end
 
    local journal_syncs = delta("Percona_raft_journal_sync_calls")
@@ -759,6 +941,25 @@ local function cmd_summarize()
       if dir_sync and dir_sync > 0 then
          print(string.format("  first-create directory sync total=%.3fms (不计入每事务 sync 均值)", dir_sync / 1000))
       end
+   end
+   local committed_sync_calls = delta("Percona_raft_journal_committed_sync_calls")
+   if committed_sync_calls and committed_sync_calls > 0 then
+      local function committed_per_call(name)
+         local value = delta(name)
+         return value and string.format("%.3fms", value / committed_sync_calls / 1000) or "n/a"
+      end
+      print(string.format(
+         "\n-- Raft COMMITTED journal 耐久链（每次 sync 均值）--\n  calls=%d total=%s mutex_wait=%s compaction_wait=%s prepare=%s encode=%s writer_wait=%s write=%s fsync=%s publish=%s",
+         committed_sync_calls,
+         committed_per_call("Percona_raft_journal_committed_sync_us"),
+         committed_per_call("Percona_raft_journal_committed_mutex_wait_us"),
+         committed_per_call("Percona_raft_journal_committed_compaction_wait_us"),
+         committed_per_call("Percona_raft_journal_committed_prepare_us"),
+         committed_per_call("Percona_raft_journal_committed_encode_us"),
+         committed_per_call("Percona_raft_journal_committed_writer_wait_us"),
+         committed_per_call("Percona_raft_journal_committed_write_us"),
+         committed_per_call("Percona_raft_journal_committed_fsync_us"),
+         committed_per_call("Percona_raft_journal_committed_publish_us")))
    end
    local journal_batches = delta("Percona_raft_journal_batches")
    local journal_batch_fsync = delta("Percona_raft_journal_batch_fsync_us")
@@ -820,6 +1021,32 @@ local function cmd_summarize()
          {"Innodb_rows_updated", "InnoDB updates/s"}, {"Innodb_rows_deleted", "InnoDB deletes/s"},
          {"Innodb_rows_read", "InnoDB rows read/s"}, {"Innodb_data_read", "InnoDB bytes read/s"},
          {"Innodb_data_written", "InnoDB bytes written/s"}, {"Innodb_data_fsyncs", "InnoDB fsync/s"},
+         {"Percona_raft_managed_begin_calls", "Raft managed begins/s"},
+         {"Percona_raft_managed_commit_requested_calls", "Raft commit requests/s"},
+         {"Percona_raft_admission_success", "Raft admitted writes/s"},
+         {"Percona_raft_prepare_success", "Raft prepared writes/s"},
+         {"Percona_raft_proposed_sync_success", "Raft proposed syncs/s"},
+         {"Percona_raft_committed_sync_success", "Raft committed syncs/s"},
+         {"Percona_raft_journal_committed_sync_calls", "COMMITTED journal syncs/s"},
+         {"Percona_raft_wal_batch_wait_timeouts", "WAL batch wait timeouts/s"},
+         {"Com_insert", "SQL inserts/s"}, {"Com_update", "SQL updates/s"},
+         {"Com_delete", "SQL deletes/s"}, {"Com_commit", "SQL commits/s"},
+         {"Com_rollback", "SQL rollbacks/s"},
+         {"Innodb_row_lock_waits", "InnoDB row-lock waits/s"},
+         {"Innodb_row_lock_time", "InnoDB row-lock ms/s"},
+         {"Innodb_deadlocks", "InnoDB deadlocks/s"},
+         {"Innodb_os_log_fsyncs", "InnoDB redo fsync/s"},
+         {"Percona_raft_committed_sync_journal_failed", "COMMITTED journal failures/s"},
+         {"Percona_raft_framed_cache_calls", "captured cache calls/s"},
+         {"Percona_raft_framed_cache_events", "captured cache events/s"},
+         {"Percona_raft_metadata_write_rejections", "metadata write rejections/s"},
+         {"Percona_raft_dml_target_rejections", "DML target rejections/s"},
+         {"Percona_raft_unmanaged_write_rejections", "unmanaged write rejections/s"},
+         {"Percona_raft_capture_epoch_mismatches", "capture epoch mismatches/s"},
+         {"Percona_raft_dml_extension_admitted_insert_select", "insert-select admissions/s"},
+         {"Percona_raft_dml_extension_admitted_multi_table", "multi-table DML admissions/s"},
+         {"Percona_raft_dml_extension_admitted_replace", "replace admissions/s"},
+         {"Percona_raft_dml_extension_admitted_upsert", "upsert admissions/s"},
       }
       local shown_rates = {}
       for _, item in ipairs(rate_names) do
@@ -852,8 +1079,42 @@ local function cmd_summarize()
       "Percona_raft_journal_compaction_last_total_us",
       "Percona_raft_journal_compaction_last_start_epoch_us",
       "Percona_raft_journal_compaction_last_end_epoch_us",
+      "Percona_raft_journal_compaction_last_entry_wait_us",
+      "Percona_raft_journal_compaction_last_initial_drain_us",
+      "Percona_raft_journal_compaction_last_fold_us",
+      "Percona_raft_journal_compaction_last_staging_write_us",
+      "Percona_raft_journal_compaction_last_staging_fsync_us",
+      "Percona_raft_journal_compaction_last_tail_us",
+      "Percona_raft_journal_compaction_last_tail_scan_us",
+      "Percona_raft_journal_compaction_last_validation_us",
+      "Percona_raft_journal_compaction_last_publish_lock_wait_us",
+      "Percona_raft_journal_compaction_last_publish_boundary_wait_us",
+      "Percona_raft_journal_compaction_last_publish_lock_hold_us",
+      "Percona_raft_journal_compaction_last_publish_link_us",
+      "Percona_raft_journal_compaction_last_descriptor_invalidate_us",
+      "Percona_raft_journal_compaction_last_publish_rename_us",
+      "Percona_raft_journal_compaction_last_publish_dir_sync_us",
+      "Percona_raft_journal_compaction_last_mirror_swap_us",
+      "Percona_raft_read_index_confirm_max_us",
+      "Percona_raft_read_index_probe_dispatch_max_us",
+      "Percona_raft_read_index_response_wait_max_us",
+      "Percona_raft_read_index_local_confirm_max_us",
+      "Percona_raft_read_apply_wait_max_us",
       "Percona_raft_freeze_live_member_floor", "Percona_raft_durable_quorum_members",
       "Percona_raft_leader_generation", "Percona_raft_caught_up_max_lag",
+      "Percona_raft_applier_applying_index", "Percona_raft_managed_active_contexts",
+      "Percona_raft_journal_segment_count", "Percona_raft_journal_active_segment_bytes",
+      "Percona_raft_journal_manifest_generation", "Percona_raft_journal_compaction_source_files",
+      "Percona_raft_compaction_head_bytes", "Percona_raft_tombstones_retained",
+      "Percona_raft_tombstone_window_ms", "Percona_raft_reclaim_published_index",
+      "Percona_raft_reclaim_pending_index",
+      "Percona_raft_observability_recent_events", "Percona_raft_last_serving_gap_ms",
+      "Percona_raft_serving_gap_open_ms", "Percona_raft_no_leader_contact_seconds",
+      "Percona_raft_last_capture_epoch", "Percona_raft_reconcile_entry_watermark",
+      "Innodb_data_pending_fsyncs", "Innodb_data_pending_writes",
+      "Innodb_os_log_pending_fsyncs",
+      "Percona_raft_raft_status_max_us", "Percona_raft_committed_prefix_refetch_required",
+      "Percona_raft_committed_prefix_refetch_floor", "Percona_raft_binlog_synced_through_index",
       "Innodb_buffer_pool_pages_dirty", "Innodb_buffer_pool_pages_data",
       "Percona_raft_binlog_derived_through_index", "Percona_raft_binlog_backfill_active",
       "Percona_raft_binlog_backfill_from_index", "Percona_raft_binlog_backfill_through_index",
@@ -877,6 +1138,29 @@ local function cmd_summarize()
       print("\n-- local_raft_state（含 log_start / last_log / committed / durable）--")
       print("  首: " .. (series["Percona_raft_local_raft_state"][1] or ""))
       print("  末: " .. (series["Percona_raft_local_raft_state"][n] or ""))
+   end
+   local detail_states = {
+      "Percona_raft_apply_schedule_state", "Percona_raft_apply_stage_breakdown",
+      "Percona_raft_receipt_lookup_breakdown", "Percona_raft_envelope_hash_breakdown",
+      "Percona_raft_raft_status_sites", "Percona_raft_admission_permit_holder",
+      "Percona_raft_caught_up", "Percona_raft_peer_raft_state",
+      "Percona_raft_configuration",
+      "Percona_raft_reconcile_missing_members",
+   }
+   local detail_lines = {}
+   for _, name in ipairs(detail_states) do
+      local values = series[name]
+      if values then
+         local first, last = values[1] or "", values[#values] or ""
+         if first ~= "" or last ~= "" then
+            detail_lines[#detail_lines + 1] = string.format(
+               "  %-46s 首=%s 末=%s", name, first, last)
+         end
+      end
+   end
+   if #detail_lines > 0 then
+      print("\n-- 服务端写路径状态/分解（首末采样）--")
+      for _, line in ipairs(detail_lines) do print(line) end
    end
 
    -- ③ ring：分阶段分布
