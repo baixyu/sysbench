@@ -652,8 +652,10 @@ local function cmd_summarize()
    local dq = series["Percona_raft_durable_quorum_index"]
    local dq_flat_zero = dq ~= nil
    if dq_flat_zero then
+      -- 采样单元格是字符串（series 里存的是 cells[j+1] 原样），必须 tonumber 后再比；
+      -- 直接与 0 比大小/bool 会让"整列恒 0"的判定永远失效。
       for i = 1, n do
-         if (dq[i] or 0) ~= 0 then dq_flat_zero = false; break end
+         if (tonumber(dq[i]) or 0) ~= 0 then dq_flat_zero = false; break end
       end
    end
    if dq == nil then
@@ -670,7 +672,9 @@ local function cmd_summarize()
    if au ~= nil then
       local peak, at = 0, 0
       for i = 1, n do
-         local v = au[i] or 0
+         -- 同理：au[i] 是字符串单元格。Lua 里字符串与数字比较 < > 会直接报
+         -- "attempt to compare number with string"，必须 tonumber。
+         local v = tonumber(au[i]) or 0
          if v > peak then peak, at = v, i end
       end
       if peak > 0 then
