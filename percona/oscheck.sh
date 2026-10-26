@@ -52,7 +52,7 @@ if compgen -G "/sys/devices/system/cpu/cpu0/cpuidle/state*/disable" >/dev/null; 
 else
   note "cpuidle disabled?" "n/a（容器/VM 里通常没有；裸机上全 1 = 已关 C-state）"
 fi
-note "IRQ count" "$(grep -c '^ *[0-9]\+:' /proc/interrupts 2>/dev/null || echo n/a)"
+irqn=$(grep -c '^ *[0-9]\+:' /proc/interrupts 2>/dev/null); note "IRQ count" "${irqn:-n/a}"
 echo "  （mysqld 的 asio 线程可用 --percona-raft-asio-affinity 钉核；钉了之后这里应能看到 isolcpus/nohz_full 与它不是同一批核）"
 
 section "3. 内存"
