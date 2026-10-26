@@ -71,6 +71,9 @@ note "zone_reclaim_mode" "$(rd /proc/sys/vm/zone_reclaim_mode)"
 
 section "4. 存储（datadir 的 fsync 决定单事务下限）"
 note "datadir" "$(mysql -Nse 'SELECT @@datadir' 2>/dev/null || echo 'n/a（本机没有 mysql 客户端；可直接看 my.cnf 的 datadir）')"
+# 这条决定"fio 该怎么测"：O_DIRECT 要用 --direct=1，fsync 才用 psync 的默认行为。
+note "innodb_flush_method" "$(mysql -Nse 'SELECT @@innodb_flush_method' 2>/dev/null || echo 'n/a（本 fork 默认 O_DIRECT，OS 不支持时回落 fsync：ha_innodb.cc:5335）')"
+note "innodb_flush_log_at_trx_commit" "$(mysql -Nse 'SELECT @@innodb_flush_log_at_trx_commit' 2>/dev/null || echo n/a)"
 echo "  -- 块设备 --"
 lsblk -d -o NAME,ROTA,SCHED,SIZE,MODEL 2>/dev/null | sed 's/^/  /'
 for d in /sys/block/*/queue/scheduler; do
