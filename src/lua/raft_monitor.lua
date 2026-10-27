@@ -266,6 +266,7 @@ local VARS = {
    -- ReadIndex RPC diagnostics and binary identity: appended to keep existing TSV columns stable.
    {"Percona_raft_read_index_peer_timing", "s"},
    {"Percona_raft_build_id", "s"},
+   {"Percona_raft_receipt_reclaim_breakdown", "s"},
 }
 
 local TYPE_OF = {}
@@ -733,6 +734,36 @@ local function cmd_summarize()
       end
       return v
    end
+   local function parse_apply_stages(raw)
+      local stages = {}
+      for token in (raw or ""):gmatch("%S+") do
+         local name, fields = token:match("^([%w_]+):(.+)$")
+         if name ~= nil and name ~= "unclean_reuses" then
+            local values = {}
+            for value in fields:gmatch("[^/]+") do
+               values[#values + 1] = tonumber(value) or 0
+            end
+            if #values >= 5 then
+               stages[name] = {
+                  total_us = values[1], calls = values[2], max_us = values[3],
+                  lock_wait_us = values[4], lock_waits = values[5],
+               }
+            end
+         end
+      end
+      return stages
+   end
+   local function parse_key_values(raw)
+      local values = {}
+      for name, value in (raw or ""):gmatch("([%w_]+):(%d+)") do
+         values[name] = tonumber(value) or 0
+      end
+      return values
+   end
+   local function counter_delta(before, after)
+      if before == nil or after == nil then return 0 end
+      return after >= before and after - before or after
+   end
    -- commit_index 不前进的最长连续区间（≈ 完全卡住的时长）
    local stall_max, run = 0, 0
    for i = 2, n do
@@ -966,6 +997,95 @@ local function cmd_summarize()
          committed_per_call("Percona_raft_journal_committed_fsync_us"),
          committed_per_call("Percona_raft_journal_committed_publish_us")))
    end
+
+   -- These SHOW STATUS strings are cumulative snapshots. Convert them to window deltas so
+   -- one slow apply can be attributed to its phases and to InnoDB row-lock waits.
+   local apply_breakdown = series["Percona_raft_apply_stage_breakdown"]
+   if apply_breakdown and #apply_breakdown > 0 then
+      local first, last = parse_apply_stages(apply_breakdown[1]),
+                          parse_apply_stages(apply_breakdown[#apply_breakdown])
+      local max_stage_us = {}
+      for i = 1, #apply_breakdown do
+         for name, stage in pairs(parse_apply_stages(apply_breakdown[i])) do
+            max_stage_us[name] = math.max(max_stage_us[name] or 0, stage.max_us)
+         end
+      end
+      local stage_order = {"prepare", "turn_wait", "commit", "profile", "thd", "dd",
+                           "receipt", "probe", "xa_commit", "row_prepare", "row_commit"}
+      local lines = {}
+      for _, name in ipairs(stage_order) do
+         local before, after = first[name], last[name]
+         if before and after then
+            local calls = counter_delta(before.calls, after.calls)
+            local total_us = counter_delta(before.total_us, after.total_us)
+            local lock_wait_us = counter_delta(before.lock_wait_us, after.lock_wait_us)
+            local lock_waits = counter_delta(before.lock_waits, after.lock_waits)
+            if calls > 0 or total_us > 0 or lock_waits > 0 then
+               lines[#lines + 1] = string.format(
+                  "  %-12s n=%d total=%.3fms avg=%.3fms sampled_max=%.3fms innodb_lock=%.3fms/%d waits (%.3fms/wait)",
+                  name, calls, total_us / 1000,
+                  calls > 0 and total_us / calls / 1000 or 0,
+                  (max_stage_us[name] or after.max_us) / 1000,
+                  lock_wait_us / 1000, lock_waits,
+                  lock_waits > 0 and lock_wait_us / lock_waits / 1000 or 0)
+            end
+         end
+      end
+      if #lines > 0 then
+         print("\n-- apply 阶段与 InnoDB 行锁等待（窗口累计）--")
+         for _, line in ipairs(lines) do print(line) end
+      end
+   end
+
+   local reclaim_breakdown = series["Percona_raft_receipt_reclaim_breakdown"]
+   if reclaim_breakdown and #reclaim_breakdown > 0 then
+      local first, last = parse_key_values(reclaim_breakdown[1]),
+                          parse_key_values(reclaim_breakdown[#reclaim_breakdown])
+      local max_values = {}
+      local active_max = 0
+      for i = 1, #reclaim_breakdown do
+         local values = parse_key_values(reclaim_breakdown[i])
+         active_max = math.max(active_max, values.active or 0)
+         for name, value in pairs(values) do
+            if name:match("^max_") then
+               max_values[name] = math.max(max_values[name] or 0, value)
+            end
+         end
+      end
+      local calls = counter_delta(first.calls, last.calls)
+      local success = counter_delta(first.success, last.success)
+      local failed = counter_delta(first.failed, last.failed)
+      local total_us = counter_delta(first.total_us, last.total_us)
+      local checkpoint_us = counter_delta(first.checkpoint_us, last.checkpoint_us)
+      local identity_us = counter_delta(first.identity_us, last.identity_us)
+      local list_us = counter_delta(first.list_us, last.list_us)
+      local delete_us = counter_delta(first.delete_us, last.delete_us)
+      local lock_wait_us = counter_delta(first.innodb_row_lock_wait_us,
+                                         last.innodb_row_lock_wait_us)
+      local lock_waits = counter_delta(first.innodb_row_lock_waits,
+                                       last.innodb_row_lock_waits)
+      local examined = counter_delta(first.receipts_examined, last.receipts_examined)
+      local deleted = counter_delta(first.receipts_deleted, last.receipts_deleted)
+      if calls > 0 or total_us > 0 or lock_waits > 0 or examined > 0 then
+         print(string.format(
+            "\n-- receipt 回收（窗口累计）--\n  calls=%d success=%d failed=%d active=%d (sampled max=%d) total=%.3fms avg=%.3fms sampled_max=%.3fms",
+            calls, success, failed, last.active or 0, active_max,
+            total_us / 1000, calls > 0 and total_us / calls / 1000 or 0,
+            (max_values.max_us or last.max_us or 0) / 1000))
+         print(string.format(
+            "  checkpoint=%.3fms (max %.3fms) identity=%.3fms (max %.3fms) list=%.3fms (max %.3fms) delete=%.3fms (max %.3fms)",
+            checkpoint_us / 1000, (max_values.max_checkpoint_us or 0) / 1000,
+            identity_us / 1000, (max_values.max_identity_us or 0) / 1000,
+            list_us / 1000, (max_values.max_list_us or 0) / 1000,
+            delete_us / 1000, (max_values.max_delete_us or 0) / 1000))
+         print(string.format(
+            "  InnoDB row-lock wait=%.3fms waits=%d avg=%.3fms/wait max=%.3fms; receipts examined/deleted=%d/%d",
+            lock_wait_us / 1000, lock_waits,
+            lock_waits > 0 and lock_wait_us / lock_waits / 1000 or 0,
+            (max_values.max_innodb_row_lock_wait_us or 0) / 1000,
+            examined, deleted))
+      end
+   end
    local mutex_name = "Percona_raft_journal_mutex_breakdown"
    if series[mutex_name] and #series[mutex_name] > 0 then
       local function parse_mutex_breakdown(raw)
@@ -1196,7 +1316,8 @@ local function cmd_summarize()
    end
    local detail_states = {
       "Percona_raft_apply_schedule_state", "Percona_raft_apply_stage_breakdown",
-      "Percona_raft_receipt_lookup_breakdown", "Percona_raft_envelope_hash_breakdown",
+      "Percona_raft_receipt_lookup_breakdown", "Percona_raft_receipt_reclaim_breakdown",
+      "Percona_raft_envelope_hash_breakdown",
       "Percona_raft_raft_status_sites", "Percona_raft_admission_permit_holder",
       "Percona_raft_caught_up", "Percona_raft_peer_raft_state",
       "Percona_raft_configuration",

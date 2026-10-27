@@ -256,6 +256,11 @@ local STATUS_VARS = {
    "Percona_raft_unmanaged_write_rejections",
    "Percona_raft_metadata_write_rejections",
    "Percona_raft_applier_apply_count",
+   "Percona_raft_apply_stage_breakdown",
+   "Percona_raft_receipt_reclaim_breakdown",
+   "Innodb_row_lock_waits",
+   "Innodb_row_lock_time",
+   "Innodb_deadlocks",
 }
 
 local function collect_status(con)
