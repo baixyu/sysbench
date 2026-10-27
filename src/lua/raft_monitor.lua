@@ -82,7 +82,9 @@ local VARS = {
    -- 本机日志
    {"Percona_raft_journal_write_us", "c"}, {"Percona_raft_journal_fsync_us", "c"},
    {"Percona_raft_journal_batches", "c"}, {"Percona_raft_journal_applied_batch_fsync_us", "c"},
-   {"Percona_raft_journal_applied_batches", "c"}, {"Percona_raft_journal_scan_calls", "c"},
+   {"Percona_raft_journal_applied_batches", "c"},
+   {"Percona_raft_journal_mutex_breakdown", "s"},
+   {"Percona_raft_journal_scan_calls", "c"},
    {"Percona_raft_journal_scan_us", "c"}, {"Percona_raft_journal_retained_records", "g"},
    -- 引擎 apply
    {"Percona_raft_applier_apply_count", "c"}, {"Percona_raft_applier_apply_engine_us", "c"},
@@ -261,6 +263,9 @@ local VARS = {
    {"Innodb_os_log_pending_fsyncs", "g"},
    {"Com_insert", "c"}, {"Com_update", "c"}, {"Com_delete", "c"},
    {"Com_commit", "c"}, {"Com_rollback", "c"},
+   -- ReadIndex RPC diagnostics and binary identity: appended to keep existing TSV columns stable.
+   {"Percona_raft_read_index_peer_timing", "s"},
+   {"Percona_raft_build_id", "s"},
 }
 
 local TYPE_OF = {}
@@ -961,6 +966,56 @@ local function cmd_summarize()
          committed_per_call("Percona_raft_journal_committed_fsync_us"),
          committed_per_call("Percona_raft_journal_committed_publish_us")))
    end
+   local mutex_name = "Percona_raft_journal_mutex_breakdown"
+   if series[mutex_name] and #series[mutex_name] > 0 then
+      local function parse_mutex_breakdown(raw)
+         local parsed = {}
+         for name, wait_us, hold_us, count, max_wait_us, max_hold_us in
+            (raw or ""):gmatch("([%w_]+)%[(%d+),(%d+),(%d+),(%d+),(%d+)%]") do
+            parsed[name] = {
+               wait_us = tonumber(wait_us), hold_us = tonumber(hold_us),
+               count = tonumber(count), max_wait_us = tonumber(max_wait_us),
+               max_hold_us = tonumber(max_hold_us),
+            }
+         end
+         return parsed
+      end
+      local first = parse_mutex_breakdown(series[mutex_name][1])
+      local last = parse_mutex_breakdown(series[mutex_name][#series[mutex_name]])
+      local maxima = {}
+      for i = 1, #series[mutex_name] do
+         for name, values in pairs(parse_mutex_breakdown(series[mutex_name][i])) do
+            local maximum = maxima[name] or {wait_us = 0, hold_us = 0}
+            maximum.wait_us = math.max(maximum.wait_us, values.max_wait_us)
+            maximum.hold_us = math.max(maximum.hold_us, values.max_hold_us)
+            maxima[name] = maximum
+         end
+      end
+      local path_order = {"commit", "append", "applied_batch", "unapplied_read",
+                          "journal_read", "writer_publish", "compaction", "other"}
+      local lines = {}
+      for _, name in ipairs(path_order) do
+         local before, after = first[name], last[name]
+         if before and after then
+            local waits = after.wait_us >= before.wait_us and
+               after.wait_us - before.wait_us or after.wait_us
+            local holds = after.hold_us >= before.hold_us and
+               after.hold_us - before.hold_us or after.hold_us
+            local calls = after.count >= before.count and
+               after.count - before.count or after.count
+            local maximum = maxima[name] or {wait_us = 0, hold_us = 0}
+            lines[#lines + 1] = string.format(
+               "  %-14s n=%d wait=%.3fms (avg %.3fms, max %.3fms) hold=%.3fms (avg %.3fms, max %.3fms)",
+               name, calls, waits / 1000, calls > 0 and waits / calls / 1000 or 0,
+               maximum.wait_us / 1000, holds / 1000,
+               calls > 0 and holds / calls / 1000 or 0, maximum.hold_us / 1000)
+         end
+      end
+      if #lines > 0 then
+         print("\n-- journal mutex 按路径等待 / 持锁（窗口累计）--")
+         for _, line in ipairs(lines) do print(line) end
+      end
+   end
    local journal_batches = delta("Percona_raft_journal_batches")
    local journal_batch_fsync = delta("Percona_raft_journal_batch_fsync_us")
    local applied_batches = delta("Percona_raft_journal_applied_batches")
@@ -1146,6 +1201,8 @@ local function cmd_summarize()
       "Percona_raft_caught_up", "Percona_raft_peer_raft_state",
       "Percona_raft_configuration",
       "Percona_raft_reconcile_missing_members",
+      "Percona_raft_journal_mutex_breakdown",
+      "Percona_raft_build_id",
    }
    local detail_lines = {}
    for _, name in ipairs(detail_states) do
@@ -1163,12 +1220,124 @@ local function cmd_summarize()
       for _, line in ipairs(detail_lines) do print(line) end
    end
 
+   local peer_timing = series["Percona_raft_read_index_peer_timing"]
+   if peer_timing and #peer_timing > 0 and peer_timing[#peer_timing] ~= "OFF" then
+      local function split_numbers(value, separator)
+         local out = {}
+         for part in ((value or "") .. separator):gmatch("(.-)" .. separator) do
+            out[#out + 1] = tonumber(part) or 0
+         end
+         return out
+      end
+      local function parse_peer_state(raw)
+         local peers = {}
+         for id, body in (raw or ""):gmatch("id(%d+)%{([^}]*)%}") do
+            local fields = {}
+            for key, value in body:gmatch("([%w]+)=([^;}]*)") do
+               fields[key] = value
+            end
+            peers[id] = {
+               generation = split_numbers(fields.g, "/"),
+               callback = split_numbers(fields.cb, "/"),
+               counts = split_numbers(fields.c, "/"),
+               all_rtt = split_numbers(fields.rr, "/"),
+               accepted_rtt = split_numbers(fields.ar, "/"),
+               histogram = split_numbers(fields.h, ","),
+            }
+         end
+         return peers
+      end
+      local first_peers = parse_peer_state(peer_timing[1])
+      local last_peers = parse_peer_state(peer_timing[#peer_timing])
+      local boundaries = {100, 250, 500, 1000, 2000, 3000, 4000, 5000, 10000}
+      local peer_lines = {}
+      local function counter_delta(before, after, index)
+         local old = before and before[index] or 0
+         local new = after and after[index] or 0
+         return new >= old and new - old or new
+      end
+      local function histogram_percentile(histogram, total, percentile)
+         if total <= 0 then return "n/a" end
+         local target = math.ceil(total * percentile / 100)
+         local seen = 0
+         for i = 1, #histogram do
+            seen = seen + histogram[i]
+            if seen >= target then
+               return i <= #boundaries and ("<=" .. boundaries[i] .. "us") or ">10000us"
+            end
+         end
+         return ">10000us"
+      end
+      for id, after in pairs(last_peers) do
+         local before = first_peers[id]
+         local callbacks = counter_delta(before and before.counts, after.counts, 1)
+         local accepted = counter_delta(before and before.counts, after.counts, 2)
+         local rejected = counter_delta(before and before.counts, after.counts, 3)
+         local errors = counter_delta(before and before.counts, after.counts, 4)
+         local dispatch_failures = counter_delta(before and before.counts, after.counts, 5)
+         local all_rtt_samples = counter_delta(before and before.all_rtt,
+                                               after.all_rtt, 1)
+         local all_rtt_sum_us = counter_delta(before and before.all_rtt,
+                                              after.all_rtt, 2)
+         local rtt_samples = counter_delta(before and before.accepted_rtt,
+                                           after.accepted_rtt, 1)
+         local rtt_sum_us = counter_delta(before and before.accepted_rtt,
+                                          after.accepted_rtt, 2)
+         local histogram = {}
+         for i = 1, 10 do
+            histogram[i] = counter_delta(before and before.histogram,
+                                         after.histogram, i)
+         end
+         peer_lines[#peer_lines + 1] = string.format(
+            "  peer=%s callbacks=%d accepted/rejected/error/dispatch_fail=%d/%d/%d/%d rpc_cb_elapsed n=%d mean=%.3fms accepted_rpc_cb_elapsed n=%d mean=%.3fms p50=%s p95=%s p99=%s gen[pending/attempted/acked]=%d/%d/%d callback[gen/term/outcome]=%d/%d/%d",
+            id, callbacks, accepted, rejected, errors, dispatch_failures,
+            all_rtt_samples,
+            all_rtt_samples > 0 and all_rtt_sum_us / all_rtt_samples / 1000 or 0,
+            rtt_samples, rtt_samples > 0 and rtt_sum_us / rtt_samples / 1000 or 0,
+            histogram_percentile(histogram, rtt_samples, 50),
+            histogram_percentile(histogram, rtt_samples, 95),
+            histogram_percentile(histogram, rtt_samples, 99),
+            after.generation[1] or 0, after.generation[2] or 0,
+            after.generation[3] or 0, after.callback[1] or 0,
+            after.callback[2] or 0, after.callback[3] or 0)
+      end
+      table.sort(peer_lines)
+      if #peer_lines > 0 then
+         print("\n-- ReadIndex 每 peer RPC 发送到回调耗时（采样窗口；含本地调度）--")
+         for _, line in ipairs(peer_lines) do print(line) end
+      end
+   end
+
    -- ③ ring：分阶段分布
    local gaps, deliveries = {}, {}
    if sysbench.opt.ring_file ~= "" then
       local events, ring_coverage = parse_ring(read_file(sysbench.opt.ring_file))
       local by_stage, g, d, txn = stage_stats(events)
       gaps, deliveries = g, d
+      local proof_count, proof_confirmed = 0, 0
+      local required_min, required_max, ack_min, ack_max = nil, nil, nil, nil
+      local quorum_shapes = {}
+      for _, event in ipairs(events) do
+         local required = tonumber(event.read_index_required_generation)
+         if required ~= nil then
+            proof_count = proof_count + 1
+            if event.read_index_confirmed == "true" then
+               proof_confirmed = proof_confirmed + 1
+            end
+            required_min = required_min and math.min(required_min, required) or required
+            required_max = required_max and math.max(required_max, required) or required
+            local ack_lo = tonumber(event.read_index_min_ack_generation)
+            local ack_hi = tonumber(event.read_index_max_ack_generation)
+            if ack_lo and ack_lo > 0 then ack_min = ack_min and math.min(ack_min, ack_lo) or ack_lo end
+            if ack_hi and ack_hi > 0 then ack_max = ack_max and math.max(ack_max, ack_hi) or ack_hi end
+            local voters = tonumber(event.read_index_voters)
+            local fresh = tonumber(event.read_index_fresh_ack_voters)
+            if voters and fresh then
+               local shape = string.format("%d/%d", fresh, voters)
+               quorum_shapes[shape] = (quorum_shapes[shape] or 0) + 1
+            end
+         end
+      end
       print(string.format("\n-- ring 分阶段（%d 条事件，%d 笔事务）--", #events, (function() local c = 0 for _ in pairs(txn) do c = c + 1 end return c end)()))
       if ring_coverage ~= nil then
          print(string.format("  事件覆盖：%s，已收集=%s，轮询间漏失=%s，服务重启=%s，轮询错误=%s",
@@ -1184,6 +1353,18 @@ local function cmd_summarize()
          end
       else
          print("  事件覆盖：unknown（文件没有 ring-watch 覆盖记录）")
+      end
+      if proof_count > 0 then
+         local shapes = {}
+         for shape, count in pairs(quorum_shapes) do
+            shapes[#shapes + 1] = string.format("%s×%d", shape, count)
+         end
+         table.sort(shapes)
+         print(string.format(
+            "  ReadIndex proof: n=%d confirmed=%d required_gen=%s..%s ack_gen=%s..%s quorum=%s",
+            proof_count, proof_confirmed, tostring(required_min), tostring(required_max),
+            tostring(ack_min or "none"), tostring(ack_max or "none"),
+            #shapes > 0 and table.concat(shapes, ",") or "n/a"))
       end
       local stage_order = {"proposal", "proposal_batch_wait", "proposal_append_entries",
                            "proposed_sync", "committed_sync", "local_apply",
