@@ -549,7 +549,10 @@ local function cmd_lock_watch()
              w.BLOCKING_ENGINE_TRANSACTION_ID, w.BLOCKING_ENGINE_LOCK_ID,
              w.BLOCKING_THREAD_ID, w.BLOCKING_EVENT_ID, bt.PROCESSLIST_ID,
              bl.OBJECT_SCHEMA, bl.OBJECT_NAME, bl.INDEX_NAME, bl.LOCK_TYPE, bl.LOCK_MODE,
-             bl.LOCK_STATUS, LEFT(COALESCE(bs.DIGEST_TEXT, ''), 512)
+             bl.LOCK_STATUS, LEFT(COALESCE(bs.DIGEST_TEXT, ''), 512),
+             rl.LOCK_DATA, bl.LOCK_DATA,
+             LEFT(COALESCE(NULLIF(rs.SQL_TEXT, ''), rt.PROCESSLIST_INFO, ''), 1024),
+             LEFT(COALESCE(NULLIF(bs.SQL_TEXT, ''), bt.PROCESSLIST_INFO, ''), 1024)
         FROM performance_schema.data_lock_waits AS w
         LEFT JOIN performance_schema.data_locks AS rl
           ON rl.ENGINE = w.ENGINE
@@ -611,16 +614,23 @@ local function cmd_lock_watch()
             engine_transaction_id=val(3), engine_lock_id=val(4), thread_id=val(5), event_id=val(6),
             processlist_id=val(7), schema=val(8), table=val(9), index=val(10), lock_type=val(11),
             lock_mode=val(12), lock_status=val(13), statement_digest=val(14),
+            lock_data=val(27), sql_text=val(29),
          }
          local blocking = {
             engine_transaction_id=val(15), engine_lock_id=val(16), thread_id=val(17), event_id=val(18),
             processlist_id=val(19), schema=val(20), table=val(21), index=val(22), lock_type=val(23),
             lock_mode=val(24), lock_status=val(25), statement_digest=val(26),
+            lock_data=val(28), sql_text=val(30),
          }
          local wait = active[key]
          if wait == nil then
             wait = {first_seen_epoch=val(1), last_seen_epoch=val(1), sample_count=0,
                     requesting=requesting, blocking=blocking}
+         else
+            -- Keep the most recently observed lock tuple and SQL in the event;
+            -- a transaction may retain a lock after its current statement changes.
+            wait.requesting = requesting
+            wait.blocking = blocking
          end
          wait.last_seen_epoch = val(1)
          wait.sample_count = wait.sample_count + 1

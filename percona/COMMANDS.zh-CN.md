@@ -282,8 +282,21 @@ $SB src/lua/raft_monitor.lua --mysql-host=127.0.0.1 --mysql-port=$LEADER --mysql
 - `apply_stage_breakdown`、`receipt_lookup_breakdown`、`envelope_hash_breakdown`、`apply_schedule_state` 和 `peer_raft_state`
   等服务端字符串状态也会保存在 TSV；汇总打印首末值。结合 `ring-watch` 中的 proposal、quorum、handoff、callback、worker queue 和 apply 分段，
   可以区分客户端并发上升后是准入排队、proposal/WAL 耐久、COMMITTED journal、InnoDB 行锁还是 applier 调度在限制吞吐。
-- `lock-watch` 查询 `performance_schema.data_lock_waits`，把持续采样到的等待归并成 JSONL 事件，包含等待/阻塞事务与线程 ID、表/索引、锁模式和 statement digest。
-  它不记录 `LOCK_DATA` 或原始 SQL。`observed_span_ms` 是采样覆盖到的等待时长下界，短于采样间隔的等待可能漏掉；要求账号能读相应 Performance Schema 表。
+- `lock-watch` 查询 `performance_schema.data_lock_waits`，把持续采样到的等待归并成 JSONL 事件，包含等待/阻塞事务与线程 ID、连接 ID、表/索引、锁模式、`LOCK_DATA`、statement digest 和当前 SQL（优先 `events_statements_current.SQL_TEXT`，缺失时回退到 `threads.PROCESSLIST_INFO`）。`observed_span_ms` 是采样覆盖到的等待时长下界，短于采样间隔的等待可能漏掉；要求账号能读相应 Performance Schema 表。当前 SQL 可能含语句字面量，按诊断数据妥善保管输出文件。
+
+### 请求身份与 receipt 锁等待对齐
+
+标准 OLTP 脚本可选地为每笔显式事务设置唯一的 `percona_raft_request_namespace` / `percona_raft_request_id`，并在客户端 JSONL 留下连接到请求身份的映射。该模式默认关闭；启用后每笔事务增加一条 session `SET` 往返，并把 start/commit 返回记录刷新到文件。每次运行必须传入新的 `--raft-request-run-id`，避免受管请求身份复用。
+
+```bash
+mkdir -p /tmp/raft-requests
+$SB src/lua/oltp_write_only.lua --mysql-host=127.0.0.1 --mysql-port=$LEADER \
+  --mysql-user=root --mysql-db=perf --threads=32 --time=60 \
+  --raft-request-log=/tmp/raft-requests/receipt --raft-request-namespace=sb-receipt \
+  --raft-request-run-id=receipt-20261029-a run
+```
+
+这会创建 `/tmp/raft-requests/receipt.thread-<tid>.jsonl`。服务端 `percona_raft_receipt_lock_trace` 日志和 Performance Schema `lock-watch` 都记录 MySQL connection id/processlist id，可用它与 `request_start` 行关联；服务端日志中的 `request_id` 则可进一步确认具体受管事务。请求身份开关仅用于 OLTP 的 `run`，要求 MySQL 驱动和显式事务。
 - 新增的 freeze 折叠读数会记录成功次数、折叠前全 journal 扫描与发布后 reload 校验的累计字节数/耗时、重写 journal 与 tombstone segment 的字节数/耗时，
   并保存最近一次 freeze 的开始/结束 epoch 时间和总耗时。汇总按采样观察到的每次计数变化列明细；如果一个采样间隔内发生多次，
   累计次数准确，`last-*` 只能给出最近一次的明细，此时缩短 `--interval-ms`。完整性扫描仍覆盖整个 journal，不跳过校验。
@@ -361,7 +374,7 @@ bash percona/monitor.sh --sysbench=$SB \
   逐台完整汇总的合并报告**。要采集 freeze 前后客户端 p99，被包的 sysbench 命令需开启 `--report-interval=1 --percentile=99`。
 - 锁等待采集默认关闭。启用 `--lock-waits` 后，每个成员额外生成 `.lock-waits.jsonl` 和 `.lock-watch.log`；
   `--lock-interval-ms` 默认 250ms，最小 100ms。采样器只查询当前等待关系，查询失败连续三次后自行退出并记日志，不会终止被包负载。
-  Performance Schema 查询会带来少量额外开销，建议在需要定位锁争用时启用，比较压测结果时保持采样配置一致。
+  JSONL 包含双方的 `LOCK_DATA` 与当前 SQL；Performance Schema 查询会带来少量额外开销，建议在需要定位锁争用时启用，比较压测结果时保持采样配置一致。
 - `--ring-interval-ms` 控制事件轮询，默认 250ms。服务端事件环有界，轮询间隔内若新增事件超过环容量仍可能丢事件；
   JSONL 会对多次快照去重。`--print-full` 把合并报告也打到屏幕上。wrapper 检查采样文件表头含目标端口和服务端主机名；
   `raft_monitor sample` 自己也会拒绝写进"已是另一台写的"文件。

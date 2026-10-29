@@ -68,6 +68,12 @@ sysbench.cmdline.options = {
       {"Create a secondary index in addition to the PRIMARY KEY", true},
    mysql_storage_engine =
       {"Storage engine, if MySQL is used", "innodb"},
+   raft_request_log =
+      {"Write per-transaction managed Raft request identities to <prefix>.thread-<tid>.jsonl", ""},
+   raft_request_namespace =
+      {"Namespace used with --raft-request-log", "sysbench"},
+   raft_request_run_id =
+      {"Unique run token required with --raft-request-log", ""},
    pgsql_variant =
       {"Use this PostgreSQL variant when running with the " ..
           "PostgreSQL driver. The only currently supported " ..
@@ -348,6 +354,36 @@ function thread_init()
    drv = sysbench.sql.driver()
    con = drv:connect()
 
+   raft_request_trace = nil
+   if sysbench.opt.raft_request_log ~= "" then
+      assert(drv:name() == "mysql",
+             "--raft-request-log requires the MySQL driver")
+      assert(not sysbench.opt.skip_trx,
+             "--raft-request-log requires explicit transactions")
+      local namespace = sysbench.opt.raft_request_namespace
+      local run_id = sysbench.opt.raft_request_run_id
+      assert(namespace ~= "" and #namespace <= 128 and
+                namespace:match("^[%w_.:-]+$"),
+             "--raft-request-namespace must be 1..128 ASCII letters, digits, '.', '_', ':' or '-'")
+      assert(run_id ~= "" and #run_id <= 80 and run_id:match("^[%w_.:-]+$"),
+             "--raft-request-run-id must be a unique 1..80 character token using letters, digits, '.', '_', ':' or '-'")
+      local connection_id = con:query_row("SELECT CONNECTION_ID()")
+      assert(connection_id ~= nil, "cannot read MySQL CONNECTION_ID()")
+      local path = string.format("%s.thread-%d.jsonl", sysbench.opt.raft_request_log,
+                                 tonumber(sysbench.tid) or 0)
+      local fh, err = io.open(path, "w")
+      assert(fh ~= nil, string.format("cannot open request identity log %s: %s",
+                                      path, tostring(err)))
+      raft_request_trace = {
+         fh = fh,
+         connection_id = tostring(connection_id),
+         namespace = namespace,
+         run_id = run_id,
+         sequence = 0,
+         active_id = nil,
+      }
+   end
+
    -- Create global nested tables for prepared statements and their
    -- parameters. We need a statement and a parameter set for each combination
    -- of connection/table/query
@@ -380,6 +416,10 @@ end
 
 function thread_done()
    close_statements()
+   if raft_request_trace ~= nil then
+      raft_request_trace.fh:close()
+      raft_request_trace = nil
+   end
    con:disconnect()
 end
 
@@ -402,11 +442,37 @@ local function get_id()
 end
 
 function begin()
+   if raft_request_trace ~= nil then
+      local trace = raft_request_trace
+      trace.sequence = trace.sequence + 1
+      trace.active_id = string.format("%s-c%s-n%d", trace.run_id,
+                                      trace.connection_id, trace.sequence)
+      con:query(string.format(
+                   "SET SESSION percona_raft_request_namespace='%s', " ..
+                      "SESSION percona_raft_request_id='%s'",
+                   trace.namespace, trace.active_id))
+      trace.fh:write(string.format(
+                        '{"kind":"request_start","epoch":%d,"connection_id":%s,"sysbench_thread_id":%d,"namespace":"%s","request_id":"%s"}\n',
+                        os.time(), trace.connection_id,
+                        tonumber(sysbench.tid) or 0, trace.namespace,
+                        trace.active_id))
+      trace.fh:flush()
+   end
    stmt.begin:execute()
 end
 
 function commit()
    stmt.commit:execute()
+   if raft_request_trace ~= nil and raft_request_trace.active_id ~= nil then
+      local trace = raft_request_trace
+      trace.fh:write(string.format(
+                        '{"kind":"request_commit_returned","epoch":%d,"connection_id":%s,"sysbench_thread_id":%d,"namespace":"%s","request_id":"%s"}\n',
+                        os.time(), trace.connection_id,
+                        tonumber(sysbench.tid) or 0, trace.namespace,
+                        trace.active_id))
+      trace.fh:flush()
+      trace.active_id = nil
+   end
 end
 
 function execute_point_selects()
