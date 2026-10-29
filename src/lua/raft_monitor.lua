@@ -11,6 +11,7 @@
 --   sample     按间隔把状态量追加到 TSV（同名的 <out>.stop 文件出现即停；--duration-s 也可停）
 --   ring       把 PERCONA_RAFT_RECENT_EVENTS() 的 JSON 落到文件（供 summarize 算分阶段分布）
 --   ring-watch 压测期间持续轮询有界事件环，追加去重事件到 JSONL
+--   lock-watch 压测期间采样 performance_schema.data_lock_waits，输出等待方/阻塞方 JSONL
 --   summarize  读 TSV（可带 ring JSON），打印汇总 + 判读（verdict）
 --
 -- 用法（一般用 percona/monitor.sh 包住一条命令，不用手写这三个命令）：
@@ -22,7 +23,7 @@
 --
 
 if sysbench.cmdline.command == nil then
-   error("命令必填：sample | ring | ring-watch | summarize（见文件头注释）", 0)
+   error("命令必填：sample | ring | ring-watch | lock-watch | summarize（见文件头注释）", 0)
 end
 
 sysbench.cmdline.options = {
@@ -31,6 +32,7 @@ sysbench.cmdline.options = {
    ring_file = {"summarize：可选的 recent_events JSON/JSONL 文件", ""},
    client_file = {"summarize：可选的 monitor.sh 客户端区间输出（用于 freeze 前后 p99）", ""},
    interval_ms = {"sample：采样间隔（毫秒）", 1000},
+   lock_interval_ms = {"lock-watch：锁等待采样间隔（毫秒）", 250},
    duration_s = {"sample：最长采样秒数（0 = 采到 <out>.stop 出现）", 0},
    lag_warn = {"summarize：apply 滞后告警阈值（条目数）", 200},
 }
@@ -528,6 +530,135 @@ local function cmd_ring_watch()
    print(string.format("raft_monitor.ring_polls=%d coverage=%s observed=%d missed=%d resets=%d poll_errors=%d out=%s",
                        count, coverage_status, observed_events, missed_events,
                        sequence_resets, poll_errors, sysbench.opt.out))
+end
+
+-- 采集当前 InnoDB data lock waits。等待在连续采样间保持为一条记录，解除时输出；
+-- 采样停止时仍存在的等待会标记 right_censored=true。轮询间隔内短暂出现并消失的等待
+-- 无法观测到，所以 observed_span_ms 只表示采样覆盖到的下界。
+local function cmd_lock_watch()
+   if sysbench.opt.out == "" then die("lock-watch 需要 --out=<JSONL 路径>") end
+   local con = connect()
+   local interval = math.max(tonumber(sysbench.opt.lock_interval_ms) or 250, 100)
+   local stop_path = sysbench.opt.out .. ".stop"
+   local query = [[
+      SELECT UNIX_TIMESTAMP(NOW(6)),
+             w.ENGINE, w.REQUESTING_ENGINE_TRANSACTION_ID, w.REQUESTING_ENGINE_LOCK_ID,
+             w.REQUESTING_THREAD_ID, w.REQUESTING_EVENT_ID, rt.PROCESSLIST_ID,
+             rl.OBJECT_SCHEMA, rl.OBJECT_NAME, rl.INDEX_NAME, rl.LOCK_TYPE, rl.LOCK_MODE,
+             rl.LOCK_STATUS, LEFT(COALESCE(rs.DIGEST_TEXT, ''), 512),
+             w.BLOCKING_ENGINE_TRANSACTION_ID, w.BLOCKING_ENGINE_LOCK_ID,
+             w.BLOCKING_THREAD_ID, w.BLOCKING_EVENT_ID, bt.PROCESSLIST_ID,
+             bl.OBJECT_SCHEMA, bl.OBJECT_NAME, bl.INDEX_NAME, bl.LOCK_TYPE, bl.LOCK_MODE,
+             bl.LOCK_STATUS, LEFT(COALESCE(bs.DIGEST_TEXT, ''), 512)
+        FROM performance_schema.data_lock_waits AS w
+        LEFT JOIN performance_schema.data_locks AS rl
+          ON rl.ENGINE = w.ENGINE
+         AND rl.ENGINE_LOCK_ID = w.REQUESTING_ENGINE_LOCK_ID
+         AND rl.ENGINE_TRANSACTION_ID = w.REQUESTING_ENGINE_TRANSACTION_ID
+        LEFT JOIN performance_schema.data_locks AS bl
+          ON bl.ENGINE = w.ENGINE
+         AND bl.ENGINE_LOCK_ID = w.BLOCKING_ENGINE_LOCK_ID
+         AND bl.ENGINE_TRANSACTION_ID = w.BLOCKING_ENGINE_TRANSACTION_ID
+        LEFT JOIN performance_schema.threads AS rt ON rt.THREAD_ID = w.REQUESTING_THREAD_ID
+        LEFT JOIN performance_schema.threads AS bt ON bt.THREAD_ID = w.BLOCKING_THREAD_ID
+        LEFT JOIN performance_schema.events_statements_current AS rs
+          ON rs.THREAD_ID = w.REQUESTING_THREAD_ID AND rs.EVENT_ID = w.REQUESTING_EVENT_ID
+        LEFT JOIN performance_schema.events_statements_current AS bs
+          ON bs.THREAD_ID = w.BLOCKING_THREAD_ID AND bs.EVENT_ID = w.BLOCKING_EVENT_ID
+   ]]
+   local fh, err = io.open(sysbench.opt.out, "w")
+   if fh == nil then die("写不了 %s：%s", sysbench.opt.out, tostring(err)) end
+   local active, polls, poll_errors, consecutive_errors = {}, 0, 0, 0
+
+   local function json_string(v)
+      v = tostring(v or "")
+      v = v:gsub("\\", "\\\\"):gsub('"', '\\"')
+      return '"' .. v:gsub("%c", function(c) return string.format("\\u%04x", string.byte(c)) end) .. '"'
+   end
+   local function json_value(v)
+      if type(v) == "number" then return tostring(v) end
+      return json_string(v)
+   end
+   local function emit(wait, right_censored)
+      local first, last = tonumber(wait.first_seen_epoch), tonumber(wait.last_seen_epoch)
+      local span_ms = first and last and math.max(0, (last - first) * 1000) or 0
+      local fields = {
+         '"kind":"lock_wait"',
+         '"first_seen_epoch":' .. json_value(wait.first_seen_epoch),
+         '"last_seen_epoch":' .. json_value(wait.last_seen_epoch),
+         '"observed_span_ms":' .. string.format("%.3f", span_ms),
+         '"sample_count":' .. tostring(wait.sample_count),
+         '"right_censored":' .. (right_censored and "true" or "false"),
+      }
+      for _, side in ipairs({"requesting", "blocking"}) do
+         local detail = wait[side]
+         for key, value in pairs(detail) do
+            fields[#fields + 1] = json_string(side .. "_" .. key) .. ":" .. json_value(value)
+         end
+      end
+      fh:write("{" .. table.concat(fields, ",") .. "}\n")
+   end
+
+   local function poll()
+      local rs = con:query(query)
+      local current, row = {}, nil
+      while true do
+         row = rs:fetch_row()
+         if row == nil then break end
+         local function val(i) return tostring(row[i] or "") end
+         local key = table.concat({val(2), val(3), val(4), val(15), val(16)}, "|")
+         local requesting = {
+            engine_transaction_id=val(3), engine_lock_id=val(4), thread_id=val(5), event_id=val(6),
+            processlist_id=val(7), schema=val(8), table=val(9), index=val(10), lock_type=val(11),
+            lock_mode=val(12), lock_status=val(13), statement_digest=val(14),
+         }
+         local blocking = {
+            engine_transaction_id=val(15), engine_lock_id=val(16), thread_id=val(17), event_id=val(18),
+            processlist_id=val(19), schema=val(20), table=val(21), index=val(22), lock_type=val(23),
+            lock_mode=val(24), lock_status=val(25), statement_digest=val(26),
+         }
+         local wait = active[key]
+         if wait == nil then
+            wait = {first_seen_epoch=val(1), last_seen_epoch=val(1), sample_count=0,
+                    requesting=requesting, blocking=blocking}
+         end
+         wait.last_seen_epoch = val(1)
+         wait.sample_count = wait.sample_count + 1
+         current[key] = wait
+      end
+      rs:free()
+      for key, wait in pairs(active) do
+         if current[key] == nil then emit(wait, false) end
+      end
+      active = current
+      fh:flush()
+   end
+
+   while true do
+      local ok, poll_err = pcall(poll)
+      polls = polls + 1
+      if ok then
+         consecutive_errors = 0
+      else
+         poll_errors = poll_errors + 1
+         consecutive_errors = consecutive_errors + 1
+         fh:write(string.format('{"kind":"poll_error","time_epoch":%s,"error":%s}\n',
+                                json_string(os.time()), json_string(poll_err)))
+         fh:flush()
+         if consecutive_errors >= 3 then
+            io.stderr:write("raft_monitor.lock_watch stopped after 3 consecutive query errors: " .. tostring(poll_err) .. "\n")
+            break
+         end
+      end
+      local f = io.open(stop_path, "r")
+      if f then f:close(); break end
+      pcall(function() con:query_row(string.format("SELECT SLEEP(%.3f)", interval / 1000)) end)
+   end
+   for _, wait in pairs(active) do emit(wait, true) end
+   fh:close()
+   print(string.format("raft_monitor.lock_polls=%d active_at_stop=%d poll_errors=%d out=%s",
+                       polls, (function() local n=0; for _ in pairs(active) do n=n+1 end; return n end)(),
+                       poll_errors, sysbench.opt.out))
 end
 
 --
@@ -1670,6 +1801,7 @@ sysbench.cmdline.commands = {
    sample = {cmd_sample},
    ring = {cmd_ring},
    ["ring-watch"] = {cmd_ring_watch},
+   ["lock-watch"] = {cmd_lock_watch},
    summarize = {cmd_summarize},
 }
 

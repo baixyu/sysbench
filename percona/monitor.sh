@@ -25,6 +25,8 @@ USER=root
 PASSWORD=${MYSQL_PWD:-}
 INTERVAL_MS=1000
 RING_INTERVAL_MS=250
+LOCK_WAITS=0
+LOCK_INTERVAL_MS=250
 HOST_METRICS=0
 HOST_INTERVAL_MS=1000
 NODE_EXPORTER_PORT=9100
@@ -47,6 +49,8 @@ while [[ $# -gt 0 ]]; do
     --password) PASSWORD=$2; shift 2;;
     --interval-ms) INTERVAL_MS=$2; shift 2;;
     --ring-interval-ms) RING_INTERVAL_MS=$2; shift 2;;
+    --lock-waits) LOCK_WAITS=1; shift;;
+    --lock-interval-ms) LOCK_INTERVAL_MS=$2; shift 2;;
     --host-metrics) HOST_METRICS=1; shift;;
     --no-host-metrics) HOST_METRICS=0; shift;;
     --host-interval-ms) HOST_INTERVAL_MS=$2; shift 2;;
@@ -67,6 +71,10 @@ done
 [[ -n "$OUT_DIR" ]] || OUT_DIR=/tmp/raft-mon.$(date +%Y%m%d-%H%M%S)
 mkdir -p "$OUT_DIR"
 [[ -x "$SYSBENCH" || -n "$(command -v "$SYSBENCH" 2>/dev/null || true)" ]] || { echo "找不到 sysbench：$SYSBENCH" >&2; exit 2; }
+if [[ "$LOCK_WAITS" -eq 1 && ( ! "$LOCK_INTERVAL_MS" =~ ^[0-9]+$ || "$LOCK_INTERVAL_MS" -lt 100 ) ]]; then
+  echo "--lock-interval-ms 必须是 >= 100 的整数" >&2
+  exit 2
+fi
 
 conn_args=(--mysql-user="$USER" --mysql-db=mysql)   # 采样不依赖业务库
 [[ -n "$PASSWORD" ]] && conn_args+=(--mysql-password="$PASSWORD")
@@ -88,10 +96,11 @@ done
 
 sampler_pids=()
 ring_pids=()
+lock_pids=()
 host_pids=()
 host_files=()
 start_samplers() {
-  local m host port tsv i=0
+  local m host port tsv lock_file suffix i=0
   for m in "${MEMBERS[@]}"; do
     host=${m%%:*}; port=${m##*:}; i=$((i + 1))
     tsv="$OUT_DIR/$(base_of "$m").tsv"
@@ -103,7 +112,17 @@ start_samplers() {
       ring-watch --out="$OUT_DIR/$(base_of "$m").events.jsonl" --interval-ms="$RING_INTERVAL_MS" \
       > "$OUT_DIR/$(base_of "$m").ring-watch.log" 2>&1 &
     ring_pids+=("$!")
-    echo "  [monitor] 采样启动：$host:$port → $tsv + events.jsonl"
+    if [[ "$LOCK_WAITS" -eq 1 ]]; then
+      lock_file="$OUT_DIR/$(base_of "$m").lock-waits.jsonl"
+      rm -f "$lock_file" "$lock_file.stop"
+      "$SYSBENCH" "$LUA" --mysql-host="$host" --mysql-port="$port" "${conn_args[@]}" \
+        lock-watch --out="$lock_file" --lock-interval-ms="$LOCK_INTERVAL_MS" \
+        > "$OUT_DIR/$(base_of "$m").lock-watch.log" 2>&1 &
+      lock_pids+=("$!")
+    fi
+    suffix=""
+    [[ "$LOCK_WAITS" -eq 0 ]] || suffix=" + lock-waits.jsonl"
+    echo "  [monitor] 采样启动：$host:$port → $tsv + events.jsonl$suffix"
   done
   # 自检：文件得出现，且头里的 host/port 必须就是这台（串台当场发现，别等跑完才发现）
   local m2 host2 port2 tsv2 hdr
@@ -162,15 +181,18 @@ stop_samplers() {
     tsv="$OUT_DIR/$(base_of "$m").tsv"
     : > "$tsv.stop"
     : > "$OUT_DIR/$(base_of "$m").events.jsonl.stop"
+    [[ "$LOCK_WAITS" -eq 0 ]] || : > "$OUT_DIR/$(base_of "$m").lock-waits.jsonl.stop"
   done
   local f
   for f in "${host_files[@]:-}"; do : > "$f.stop"; done
   local pid
   for pid in "${sampler_pids[@]:-}"; do [[ -n "$pid" ]] && wait "$pid" 2>/dev/null; done
   for pid in "${ring_pids[@]:-}"; do [[ -n "$pid" ]] && wait "$pid" 2>/dev/null; done
+  for pid in "${lock_pids[@]:-}"; do [[ -n "$pid" ]] && wait "$pid" 2>/dev/null; done
   for pid in "${host_pids[@]:-}"; do [[ -n "$pid" ]] && wait "$pid" 2>/dev/null; done
   sampler_pids=()
   ring_pids=()
+  lock_pids=()
   host_pids=()
 }
 trap 'stop_samplers' EXIT
@@ -222,7 +244,12 @@ COMBINED="$OUT_DIR/${TAG}-combined.txt"
   echo "# 被包命令：${CMD[*]}"
   echo "# 客户端区间输出：$OUT_DIR/client-intervals.tsv（需被包命令启用 sysbench --report-interval）"
   echo "# 阶段标记：$OUT_DIR/phase-markers.tsv"
-  for m in "${MEMBERS[@]}"; do echo "# 采样文件：$OUT_DIR/$(base_of "$m").tsv；事件：$OUT_DIR/$(base_of "$m").events.jsonl"; done
+  for m in "${MEMBERS[@]}"; do
+    echo "# 采样文件：$OUT_DIR/$(base_of "$m").tsv；事件：$OUT_DIR/$(base_of "$m").events.jsonl"
+    if [[ "$LOCK_WAITS" -eq 1 ]]; then
+      echo "# 锁等待：$OUT_DIR/$(base_of "$m").lock-waits.jsonl；日志：$OUT_DIR/$(base_of "$m").lock-watch.log"
+    fi
+  done
   for f in "${host_files[@]:-}"; do echo "# 主机指标：$f；日志：$f.log"; done
   echo
   echo "## 三台并排"
