@@ -331,6 +331,25 @@ $SB src/lua/oltp_write_only.lua --mysql-host=127.0.0.1 --mysql-port=$LEADER \
 
 ```bash
 # 跨成员一致性：8 表聚合（不逐行 dump）+ 单表逐行摘要 dump+diff
+### 6.4.1 一次核对所有表（`percona/verify_all_tables.sh`）
+
+`verify.sh` 需要显式表清单；表一多就手写不动了。这个 wrapper 自动生成/发现清单，
+并给出**逐表**结论（哪张一致、哪张不一致）：
+
+```bash
+bash percona/verify_all_tables.sh --sysbench=$SB --schema-db=$DB \
+  --table-prefix=sbtest --tables=64 \
+  --member 10.188.62.79:6606 --member 10.214.38.209:6606 --member 10.188.48.140:6606 \
+  --user=root --password=root
+# 表名不止 <prefix>N 时就用 --discover（从 information_schema 按 ^prefix[0-9]+$ 发现）
+#   bash percona/verify_all_tables.sh ... --discover
+# 默认只跑 aggregate（快）；要逐行摘要再加 --dump（慢，会指出第一处不同的行）
+# 发现某张表不一致后，只看它：
+#   bash percona/verify_all_tables.sh ... --only=sbtest3
+```
+
+输出是逐表矩阵（每台的行数）+ 结论；退出码 0 全一致 / 1 有表不一致 / 2 检查未完成。
+
 bash percona/verify.sh --sysbench=$SB --schema-db=perf --schema-tables=sbtest1,sbtest8 \
   --user=root --skip-dump --member 127.0.0.1:43701 --member 127.0.0.1:43702 --member 127.0.0.1:43703
 bash percona/verify.sh --sysbench=$SB --schema-db=perf --schema-tables=sbtest1 \
