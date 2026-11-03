@@ -499,6 +499,31 @@ bash percona/concurrency_matrix.sh \
   并抽样核对 `sbtest1` 的行数与 `--table-size`；拿不到 mysql 客户端时只告警不阻断（`--skip-preflight` 可跳过）；
 - `--dry-run` 只打印将执行的命令，适合先确认参数。
 
+## 5.6 逐表清空（受管 transition）：`percona/truncate_all_tables.sh`
+
+受管集群里的 `TRUNCATE` 也必须走 `PERCONA_RAFT_SCHEMA_TRANSITION()`（TRUNCATE TABLE 在允许的 DDL 集合内）。
+每条 SQL 是一次 schema transition ⇒ **epoch +1**、并复制到所有成员；脚本逐表执行并逐条核对 `result=APPLIED`：
+
+```bash
+# ① 先看清单（不执行）
+bash percona/truncate_all_tables.sh --schema-db=$DB --table-prefix=sbtest --tables=64 \
+  --member 10.188.62.79:6606 --member 10.214.38.209:6606 --member 10.188.48.140:6606 \
+  --user=root --password=root --dry-run
+
+# ② 确认后执行（自动从 --member 里找 Leader；执行完等各成员 epoch 追平）
+bash percona/truncate_all_tables.sh --schema-db=$DB --table-prefix=sbtest --tables=64 \
+  --member 10.188.62.79:6606 --member 10.214.38.209:6606 --member 10.188.48.140:6606 \
+  --user=root --password=root --yes
+```
+
+- 每条等价于 `SELECT PERCONA_RAFT_SCHEMA_TRANSITION('TRUNCATE TABLE `db`.`sbtestN`');`
+- `--discover` 用 information_schema 自动发现 `<prefix>N`；`--only=a,b` 只处理指定表；
+- 失败默认即停（`--keep-going` 继续），退出码 0 全 APPLIED / 1 有表失败 / 2 前置条件不满足；
+- `--wait-members=SEC`（默认 120）等每个成员 `Percona_raft_schema_epoch` 追到最终值，0 = 不等；
+- 不加 `--yes` 且不是 `--dry-run` 时**拒绝执行**（防误清）。
+
+清空后要重新灌数：`prepare.sh --skip-ddl`（表已存在且为空，符合"只灌空表"的前置）。
+
 ## 6. 验收命令集
 
 ### 6.1 M1 收尾（Linux 上的正式口径，leader 直跑）
