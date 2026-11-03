@@ -73,9 +73,10 @@ if [ -n "$ONLY" ]; then
 elif [ "$DISCOVER" -eq 1 ]; then
   first=${MEMBERS[0]}; host=${first%%:*}; port=${first##*:}
   TABLE_LIST=$(MYSQL_PWD="$PASSWORD" "$MYSQL_CLI" --connect-timeout=5 -h"$host" -P"$port" -u"$USER" -Nse "
-    SELECT GROUP_CONCAT(table_name ORDER BY CAST(SUBSTRING(table_name, LENGTH('$PREFIX')+1) AS UNSIGNED))
+    SELECT COALESCE(GROUP_CONCAT(table_name ORDER BY CAST(SUBSTRING(table_name, LENGTH('$PREFIX')+1) AS UNSIGNED)), '')
       FROM information_schema.tables
      WHERE table_schema='$DB' AND table_name REGEXP '^${PREFIX}[0-9]+$';" 2>/dev/null)
+  [ "$TABLE_LIST" = "NULL" ] && TABLE_LIST=""
   [ -n "${TABLE_LIST:-}" ] || { echo "从 $first 发现不到 ${PREFIX}N 形式的表" >&2; exit 2; }
 else
   TABLE_LIST=$(printf "${PREFIX}%d," $(seq 1 "$NTABLES")); TABLE_LIST=${TABLE_LIST%,}

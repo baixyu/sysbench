@@ -102,9 +102,10 @@ if [ -n "$ONLY" ]; then
 elif [ "$DISCOVER" -eq 1 ]; then
   first=${MEMBERS[0]:-}; [ -n "$first" ] || { echo "--discover 需要至少一个 --member" >&2; exit 2; }
   TABLES=$(q_quiet "${first%%:*}" "${first##*:}" "
-    SELECT GROUP_CONCAT(table_name ORDER BY CAST(SUBSTRING(table_name, LENGTH('$PREFIX')+1) AS UNSIGNED))
+    SELECT COALESCE(GROUP_CONCAT(table_name ORDER BY CAST(SUBSTRING(table_name, LENGTH('$PREFIX')+1) AS UNSIGNED)), '')
       FROM information_schema.tables
      WHERE table_schema='$DB' AND table_name REGEXP '^${PREFIX}[0-9]+$';")
+  [ "$TABLES" = "NULL" ] && TABLES=""
   [ -n "${TABLES:-}" ] || { echo "发现不到 ${PREFIX}N 形式的表（在 ${first} 上查 $DB）" >&2; exit 2; }
 else
   TABLES=$(printf "${PREFIX}%d," $(seq 1 "$NTABLES")); TABLES=${TABLES%,}

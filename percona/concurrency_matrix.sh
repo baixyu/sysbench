@@ -164,11 +164,14 @@ if [[ "$SKIP_PREFLIGHT" -eq 0 && "$DRY_RUN" -eq 0 ]]; then
   if command -v "$MYSQL_CLI" >/dev/null 2>&1; then
     cli=("$MYSQL_CLI" --connect-timeout=5 -h"$LEADER_HOST" -P"$LEADER_PORT" -u"$LEADER_USER")
     # 密码走环境变量（只对本次调用生效、不进 argv），与工具其它脚本的口径一致
+    # COALESCE 不能省：没有缺表时 GROUP_CONCAT 返回 SQL NULL，-Nse 会把它打成字符串
+    # "NULL"，会让预检误报"缺少 [NULL]"。同理下面把 "NULL" 一律当空处理。
     missing=$(MYSQL_PWD="$LEADER_PASSWORD" "${cli[@]}" -Nse "
       WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<$TABLES)
-      SELECT GROUP_CONCAT(n ORDER BY n) FROM seq
+      SELECT COALESCE(GROUP_CONCAT(n ORDER BY n), '') FROM seq
        WHERE NOT EXISTS (SELECT 1 FROM information_schema.tables t
               WHERE t.table_schema='$DB' AND t.table_name=CONCAT('sbtest',n));" 2>/dev/null)
+    [ "$missing" = "NULL" ] && missing=""
     pre_rc=$?
     if [[ $pre_rc -ne 0 ]]; then
       echo "    预检：$MYSQL_CLI 查询失败（rc=$pre_rc），跳过表齐全性检查" >&2
