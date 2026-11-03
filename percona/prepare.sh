@@ -39,6 +39,11 @@
 #   --preview-password=PW   预演实例的密码（缺省取 MYSQL_PWD）
 #   --leader-password=PW    Leader/成员 的密码（缺省取 MYSQL_PWD）
 #   --existing-tables=a,b   显式给出"在 force"的表集合（预检用；缺省= 清单里已存在的前缀）
+#   --preview-reset         在 preview 前先 DROP 预演实例上**同名**的目标表，让 preview 真正执行本次
+#                           DDL。为什么需要：若预演实例上残留了一张旧参数建的 sbtestN，脚本会给它加
+#                           --skip-ddl，preview 便照着旧表派生期望指纹，与集群按本次 DDL 新建的表不符
+#                           ⇒ propose 已 APPLIED 却在核对环节 FATAL（实测报"本机派生指纹与目标不一致"）。
+#                           DROP 只动预演实例（Raft 关闭的草稿实例），不影响集群。
 #   --load-threads=N        并发灌数线程数（默认 1）。每个线程只插自己那段 id 分片：
 #                           id 范围 [floor(total*(k-1)/N)+1, floor(total*k/N)]，各自独立连接。
 #                           N>1 时必须 --skip-ddl（建表要事先完成），行长回读在所有线程
@@ -96,6 +101,7 @@ SKIP_DDL=0; SKIP_LOAD=0; DO_VERIFY=0; WAIT_APPLIED=1; ALLOW_NONEMPTY=0
 LOAD_THREADS=1
 MONITOR=0; MONITOR_INTERVAL_MS=1000; MONITOR_RING_INTERVAL_MS=250; MONITOR_OUT_DIR=
 MONITOR_HOST_METRICS=0; MONITOR_HOST_INTERVAL_MS=1000; MONITOR_NODE_EXPORTER_PORT=9100; MONITOR_PROMETHEUS_URL=
+PREVIEW_RESET=0
 MONITOR_NODE_EXPORTER_URLS=(); MONITOR_PROMETHEUS_INSTANCES=()
 
 while [[ $# -gt 0 ]]; do
@@ -126,6 +132,7 @@ while [[ $# -gt 0 ]]; do
     --member) MEMBERS+=("$2"); shift 2;;
     --skip-ddl) SKIP_DDL=1; shift;;
     --load-threads) LOAD_THREADS=$2; shift 2;;
+    --preview-reset) PREVIEW_RESET=1; shift;;
     --skip-load) SKIP_LOAD=1; shift;;
     --verify) DO_VERIFY=1; shift;;
     --allow-nonempty) ALLOW_NONEMPTY=1; shift;;
@@ -242,6 +249,7 @@ if [[ $MONITOR -eq 1 && -z "${RAFT_MONITOR_WRAPPED:-}" ]]; then
       --monitor-host-metrics|--no-monitor-host-metrics) continue;;
       --monitor-host-interval-ms|--monitor-node-exporter-port|--monitor-prometheus-url) skip_next=1; continue;;
       --monitor-node-exporter-url|--monitor-prometheus-instance) skip_next=1; continue;;
+      --preview-reset) continue;;
       --monitor-out-dir) skip_next=1; continue;;
       *) forward+=("$a");;
     esac
@@ -452,8 +460,17 @@ else
       [[ -n "$LEADER_PASSWORD" ]] && rs_args+=(--leader-password="$LEADER_PASSWORD")
       [[ ${#SB_EXTRA_STR[@]} -gt 0 ]] && rs_args+=(--sysbench-args="${SB_EXTRA_STR[*]}")
       if preview_has_table "$t"; then
-        echo "   （预演实例上已有 $t ⇒ 传 --skip-ddl，避免重复执行 DDL）"
-        rs_args+=(--skip-ddl)
+        if [[ "$PREVIEW_RESET" -eq 1 ]]; then
+          echo "   （--preview-reset：先删掉预演实例上残留的 $t，让 preview 按本次 DDL 重新建）"
+          cli "$PREVIEW_HOST" "$PREVIEW_PORT" "$PREVIEW_USER" "$PREVIEW_PASSWORD" \
+              -e "DROP TABLE IF EXISTS \`$SCHEMA_DB\`.\`$t\`" >/dev/null 2>&1 \
+            || { echo "预演实例上 DROP $t 失败" >&2; exit 1; }
+        else
+          echo "   （预演实例上已有 $t ⇒ 传 --skip-ddl，避免重复执行 DDL）"
+          echo "     注意：若这张表是**旧参数**建的（例如 --row-length/--types 变过），preview 派生的期望指纹会与集群不符，"
+          echo "           典型症状是 propose 已 APPLIED 却在核对时报'本机派生指纹与目标不一致'；此时加 --preview-reset 重跑即可。" >&2
+          rs_args+=(--skip-ddl)
+        fi
       fi
       [[ $WAIT_APPLIED -eq 1 ]] && rs_args+=(--wait-applied)
       for m in "${MEMBERS[@]}"; do rs_args+=(--member "$m"); done

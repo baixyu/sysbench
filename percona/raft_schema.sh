@@ -193,8 +193,20 @@ echo "=== 2/3 propose：对 Leader ${LEADER_HOST}:${LEADER_PORT} 提交单参数
 propose_args=("${common[@]}" --expect-fingerprint="$fingerprint" "${ddl_args[@]}")
 [[ $WAIT_APPLIED -eq 1 ]] && propose_args+=(--wait-applied)
 propose_rc=0
-"$SYSBENCH" "$LUA" "${leader_conn[@]}" "${propose_args[@]}" propose || propose_rc=$?
-[[ $propose_rc -eq 0 ]] || { echo "propose 步骤失败（rc=${propose_rc}）：对 Leader ${LEADER_HOST}:${LEADER_PORT} 的提案没成功（原因见上面 raft_schema.result / detail）。" >&2; exit 1; }
+propose_out=$("$SYSBENCH" "$LUA" "${leader_conn[@]}" "${propose_args[@]}" propose 2>&1) || propose_rc=$?
+echo "$propose_out"
+if [[ $propose_rc -ne 0 ]]; then
+  echo "propose 步骤失败（rc=${propose_rc}）：对 Leader ${LEADER_HOST}:${LEADER_PORT} 的提案没成功（原因见上面 raft_schema.result / detail）。" >&2
+  if grep -q '本机派生指纹与目标不一致' <<<"$propose_out"; then
+    echo "  · 这是**客户端核对**失败，不是提案失败：上面若已有 result=APPLIED，集群侧的 schema 变更已经落地。" >&2
+    echo "    最常见原因：预演实例上残留了同名表、且形状与本次 DDL 不同（例如 --row-length / --types 变过），" >&2
+    echo "    preview 于是按旧表派生期望指纹。核对差异（把 表名 换成报错里那张）：" >&2
+    echo "      SHOW CREATE TABLE ${SCHEMA_DB}.表名   # 在预演实例 ${PREVIEW_HOST}:${PREVIEW_PORT} 上" >&2
+    echo "      SHOW CREATE TABLE ${SCHEMA_DB}.表名   # 在 Leader ${LEADER_HOST}:${LEADER_PORT} 上" >&2
+    echo "    修法：在预演实例上 DROP 掉那张表后重跑；或用 prepare.sh 的 --preview-reset（只 DROP 预演实例）。" >&2
+  fi
+  exit 1
+fi
 
 echo "=== 3/3 verify：逐成员核对 epoch 与本机自派生指纹 ==="
 if [[ ${#MEMBERS[@]} -eq 0 ]]; then
