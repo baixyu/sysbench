@@ -103,6 +103,9 @@ done
 [[ -n "$TABLE_SIZE" ]] || { echo "必须给 --table-size（与灌数时一致）" >&2; exit 2; }
 LEADER_USER=${LEADER_USER:-$USER}
 LEADER_PASSWORD=${LEADER_PASSWORD:-$PASSWORD}
+# Monitoring uses the general credentials when supplied; otherwise reuse the
+# benchmark credentials so the samplers can authenticate with the same account.
+MONITOR_PASSWORD=${PASSWORD:-$LEADER_PASSWORD}
 
 # ── 并发梯度：接受 "4,8,16" 或 "4-128:2"（两端含，步长倍率）──────────────
 expand_threads() {
@@ -300,8 +303,10 @@ for sc in ${SCENARIO_SPEC//,/ }; do
              --threads="$t" --time="$TIME_S"
              --report-interval=1 --percentile=99 run)
 
-    mon=(bash "$MONITOR" --sysbench="$SYSBENCH" "${MEMBERS[@]}" --user="$USER")
-    [[ -n "$PASSWORD" ]] && mon+=(--password="$PASSWORD")
+    mon=(bash "$MONITOR" --sysbench="$SYSBENCH")
+    for member in "${MEMBERS[@]}"; do mon+=(--member "$member"); done
+    mon+=(--user="$USER")
+    [[ -n "$MONITOR_PASSWORD" ]] && mon+=(--password="$MONITOR_PASSWORD")
     mon+=(--interval-ms="$INTERVAL_MS" --ring-interval-ms="$RING_INTERVAL_MS")
     [[ "$HOST_METRICS" -eq 1 ]] && mon+=(--host-metrics --node-exporter-port="$NODE_EXPORTER_PORT")
     [[ -n "$PROMETHEUS_URL" ]] && mon+=(--prometheus-url="$PROMETHEUS_URL")
