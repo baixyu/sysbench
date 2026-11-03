@@ -325,9 +325,10 @@ for sc in ${SCENARIO_SPEC//,/ }; do
       state_before=$(cat "$run/status-before.txt" 2>/dev/null)
       printf 'status_before=%s (state|serving|reconciliation|log_bin|epoch)\n' "${state_before:-unknown}" >> "$run/run.txt"
       if [[ "$REQUIRE_LEADER" -eq 1 && "$DRY_RUN" -eq 0 ]]; then
-        case "$state_before" in
-          LEADER*)
-            if [[ "$state_before" == *"|OFF|"* ]]; then
+        IFS='|' read -r raft_state raft_serving _ <<< "$state_before"
+        case "$raft_state" in
+          LEADER)
+            if [[ "$raft_serving" == "OFF" ]]; then
               echo "     警告：$LEADER_HOST:$LEADER_PORT 是 LEADER 但 serving=OFF（$state_before）" >&2
             fi;;
           ""|unknown) echo "     警告：读不到 $LEADER_HOST:$LEADER_PORT 的角色/服务态，继续" >&2;;
