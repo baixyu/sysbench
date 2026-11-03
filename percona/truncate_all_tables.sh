@@ -133,6 +133,19 @@ else
   LEADER_HOST=${LEADER_HOST:-${MEMBERS[0]%%:*}}
   [ -n "$LEADER_HOST" ] || { echo "给了 --leader-port 但没给 --leader-host（也没有 --member 可推断）" >&2; exit 2; }
 fi
+# ── 连通性 + 身份预检（关键：q_quiet 会吞 stderr，这里必须显式报错）────────
+preflight_out=$(q "$LEADER_HOST" "$LEADER_PORT" "SELECT 1" 2>&1); preflight_rc=$?
+if [ $preflight_rc -ne 0 ] || [ "$preflight_out" != "1" ]; then
+  echo "✗ 连不上 Leader ${LEADER_HOST}:${LEADER_PORT}（或查询被拒），无法开始：" >&2
+  echo "    ${preflight_out:0:300}" >&2
+  echo "  常见原因与修法：" >&2
+  echo "    · 密码不对：核对 --password（或 export MYSQL_PWD=...）" >&2
+  echo "    · caching_sha2_password + 非 TLS：加 --mysql-cli-args=\"--get-server-public-key\"" >&2
+  echo "    · 要求 TLS：--mysql-cli-args=\"--ssl-mode=REQUIRED\"" >&2
+  echo "    · 端口/主机写错：mysql -h${LEADER_HOST} -P${LEADER_PORT} -u${USER} -p -e 'SELECT 1'" >&2
+  exit 2
+fi
+
 echo "=== 清空 $DB 的 $N 张表（受管 transition）==="
 echo "    Leader：$LEADER_HOST:$LEADER_PORT"
 echo "    表：${TABLES:0:120}$([ ${#TABLES} -gt 120 ] && echo '…')"
@@ -150,6 +163,16 @@ for t in ${TABLES//,/ }; do
     continue
   fi
   out=$(q_quiet "$LEADER_HOST" "$LEADER_PORT" "SELECT PERCONA_RAFT_SCHEMA_TRANSITION('$sql')")
+  if [ -z "$out" ]; then
+    # q_quiet 丢了 stderr；空返回几乎总是连接/认证/权限问题，重跑一次把原文拿出来
+    err=$(q "$LEADER_HOST" "$LEADER_PORT" "SELECT PERCONA_RAFT_SCHEMA_TRANSITION('$sql')" 2>&1)
+    printf '  [%d/%d] %-12s ✗ 无返回（查询失败）\n' "$i" "$N" "$t"
+    printf '          错误：%s\n' "$(tr '\n' ' ' <<<"$err" | cut -c1-300)"
+    printf "          语句：SELECT PERCONA_RAFT_SCHEMA_TRANSITION('%s')\n" "$sql"
+    failed+=("$t")
+    [ "$KEEP_GOING" -eq 1 ] || { echo "  停止（未加 --keep-going）" >&2; break; }
+    continue
+  fi
   res=$(grep -oE '"result"[[:space:]]*:[[:space:]]*"[A-Z_]+"' <<<"$out" | sed 's/.*"\([A-Z_]*\)"$/\1/' | head -1)
   to_e=$(grep -oE '"to_epoch"[[:space:]]*:[[:space:]]*[0-9]+' <<<"$out" | grep -oE '[0-9]+$' | head -1)
   if [ "$res" = "APPLIED" ]; then
