@@ -72,9 +72,19 @@ if [ "$DRY_RUN" -eq 0 ] && [ "$YES" -eq 0 ]; then
   exit 2
 fi
 
-q() { # q <host> <port> <sql>  -> 单值输出
+q() { # q <host> <port> <sql>  -> 单值输出（错误写到 stderr，便于诊断）
   MYSQL_PWD="$PASSWORD" "$MYSQL_CLI" --connect-timeout=5 "${CLI_EXTRA[@]}" \
-    -h"$1" -P"$2" -u"$USER" -Nse "$3" 2>/dev/null
+    -h"$1" -P"$2" -u"$USER" -Nse "$3"
+}
+q_quiet() { q "$@" 2>/dev/null; }
+probe_state() { # probe_state <host> <port> -> 打印 LEADER/FOLLOWER/''，错误走 stderr
+  local out rc
+  out=$(q "$1" "$2" "SHOW STATUS LIKE 'Percona_raft_state'" 2>&1); rc=$?
+  if [ $rc -ne 0 ]; then
+    printf 'PROBE_ERROR\t%s\n' "$(tr '\n' ' ' <<<"$out" | cut -c1-160)"
+    return 0
+  fi
+  awk '{print $2}' <<<"$out"
 }
 
 # ── 表清单 ────────────────────────────────────────────────────────────────
@@ -82,7 +92,7 @@ if [ -n "$ONLY" ]; then
   TABLES=$ONLY
 elif [ "$DISCOVER" -eq 1 ]; then
   first=${MEMBERS[0]:-}; [ -n "$first" ] || { echo "--discover 需要至少一个 --member" >&2; exit 2; }
-  TABLES=$(q "${first%%:*}" "${first##*:}" "
+  TABLES=$(q_quiet "${first%%:*}" "${first##*:}" "
     SELECT GROUP_CONCAT(table_name ORDER BY CAST(SUBSTRING(table_name, LENGTH('$PREFIX')+1) AS UNSIGNED))
       FROM information_schema.tables
      WHERE table_schema='$DB' AND table_name REGEXP '^${PREFIX}[0-9]+$';")
@@ -94,19 +104,40 @@ N=$(awk -F, '{print NF}' <<<"$TABLES")
 
 # ── 定位 Leader ───────────────────────────────────────────────────────────
 if [ -z "$LEADER_PORT" ]; then
+  [ ${#MEMBERS[@]} -gt 0 ] || { echo "必须给 --member（用于探测 Leader）或 --leader-host/--leader-port" >&2; exit 2; }
+  echo "--- 探测 Leader（扫每个成员的 Percona_raft_state）---"
+  probe_errors=0
   for m in "${MEMBERS[@]}"; do
-    st=$(q "${m%%:*}" "${m##*:}" "SHOW STATUS LIKE 'Percona_raft_state'" | awk '{print $2}')
-    if [ "$st" = "LEADER" ]; then LEADER_HOST=${m%%:*}; LEADER_PORT=${m##*:}; fi
+    st=$(probe_state "${m%%:*}" "${m##*:}")
+    case "$st" in
+      PROBE_ERROR*) probe_errors=$((probe_errors + 1))
+                    printf '    %-28s ✗ 查询失败：%s\n' "$m" "${st#PROBE_ERROR$'\t'}" >&2;;
+      LEADER)       printf '    %-28s LEADER\n' "$m"; LEADER_HOST=${m%%:*}; LEADER_PORT=${m##*:};;
+      '')           printf '    %-28s （没有该状态量——这台不是 Raft 成员？）\n' "$m" >&2;;
+      *)            printf '    %-28s %s\n' "$m" "$st";;
+    esac
   done
-  [ -n "$LEADER_PORT" ] || { echo "没有成员报 LEADER（选举中？）——用 --leader-host/--leader-port 显式指定" >&2; exit 2; }
+  if [ -z "$LEADER_PORT" ]; then
+    if [ "$probe_errors" -eq "${#MEMBERS[@]}" ]; then
+      echo "  ✗ 所有成员的探测查询都失败了 ⇒ 不是选举问题，而是**连不上/认证失败**。" >&2
+      echo "    先手工验证一次：mysql -h<host> -P<port> -u$USER -p -e \"SHOW STATUS LIKE 'Percona_raft_state';\"" >&2
+      echo "    常见修法：--mysql-cli-args=\"--get-server-public-key\"（caching_sha2_password 非 TLS）或 \"--ssl-mode=REQUIRED\"。" >&2
+      exit 2
+    fi
+    echo "  ✗ 没有成员报 LEADER（都连上了，但状态里没有 LEADER）⇒ 可能正在选举，或集群未就绪。" >&2
+    echo "    看一下：SHOW STATUS LIKE 'Percona_raft_%'; 或 percona/monitor.sh 的 Percona_raft_state 列。" >&2
+    echo "    确认谁是 Leader 后可显式指定：--leader-host=<host> --leader-port=<port>" >&2
+    exit 2
+  fi
 else
   LEADER_HOST=${LEADER_HOST:-${MEMBERS[0]%%:*}}
+  [ -n "$LEADER_HOST" ] || { echo "给了 --leader-port 但没给 --leader-host（也没有 --member 可推断）" >&2; exit 2; }
 fi
 echo "=== 清空 $DB 的 $N 张表（受管 transition）==="
 echo "    Leader：$LEADER_HOST:$LEADER_PORT"
 echo "    表：${TABLES:0:120}$([ ${#TABLES} -gt 120 ] && echo '…')"
 
-epoch0=$(q "$LEADER_HOST" "$LEADER_PORT" "SHOW STATUS LIKE 'Percona_raft_schema_epoch'" | awk '{print $2}')
+epoch0=$(q_quiet "$LEADER_HOST" "$LEADER_PORT" "SHOW STATUS LIKE 'Percona_raft_schema_epoch'" | awk '{print $2}')
 echo "    schema_epoch 起始：${epoch0:-?}"
 
 # ── 逐表执行 ──────────────────────────────────────────────────────────────
@@ -118,7 +149,7 @@ for t in ${TABLES//,/ }; do
     printf '  [%d/%d] %s\n' "$i" "$N" "$sql"
     continue
   fi
-  out=$(q "$LEADER_HOST" "$LEADER_PORT" "SELECT PERCONA_RAFT_SCHEMA_TRANSITION('$sql')")
+  out=$(q_quiet "$LEADER_HOST" "$LEADER_PORT" "SELECT PERCONA_RAFT_SCHEMA_TRANSITION('$sql')")
   res=$(grep -oE '"result"[[:space:]]*:[[:space:]]*"[A-Z_]+"' <<<"$out" | sed 's/.*"\([A-Z_]*\)"$/\1/' | head -1)
   to_e=$(grep -oE '"to_epoch"[[:space:]]*:[[:space:]]*[0-9]+' <<<"$out" | grep -oE '[0-9]+$' | head -1)
   if [ "$res" = "APPLIED" ]; then
@@ -135,7 +166,7 @@ done
 [ "$DRY_RUN" -eq 1 ] && { echo "(dry-run) 以上为将执行的 SQL；确认后加 --yes 执行"; exit 0; }
 
 # ── 等各成员追平 epoch ────────────────────────────────────────────────────
-final_epoch=$(q "$LEADER_HOST" "$LEADER_PORT" "SHOW STATUS LIKE 'Percona_raft_schema_epoch'" | awk '{print $2}')
+final_epoch=$(q_quiet "$LEADER_HOST" "$LEADER_PORT" "SHOW STATUS LIKE 'Percona_raft_schema_epoch'" | awk '{print $2}')
 echo
 echo "=== 结果：APPLIED ${ok}/${N}，失败 ${#failed[@]}，Leader epoch ${epoch0:-?} → ${final_epoch:-?} ==="
 if [ ${#failed[@]} -gt 0 ]; then
@@ -149,7 +180,7 @@ if [ "$WAIT_MEMBERS" -gt 0 ] && [ ${#MEMBERS[@]} -gt 0 ] && [ -n "${final_epoch:
   while :; do
     pending=()
     for m in "${MEMBERS[@]}"; do
-      e=$(q "${m%%:*}" "${m##*:}" "SHOW STATUS LIKE 'Percona_raft_schema_epoch'" | awk '{print $2}')
+      e=$(q_quiet "${m%%:*}" "${m##*:}" "SHOW STATUS LIKE 'Percona_raft_schema_epoch'" | awk '{print $2}')
       [ "${e:-0}" = "$final_epoch" ] || pending+=("${m}:${e:-?}")
     done
     [ ${#pending[@]} -eq 0 ] && { echo "    ✓ 所有成员 epoch=$final_epoch"; break; }
