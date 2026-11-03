@@ -66,6 +66,15 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$DB" ] || { echo "必须给 --schema-db" >&2; exit 2; }
+
+# 客户端可用性：不同发行版/安装方式的 mysql 客户端能力不同（TLS、caching_sha2 插件的
+# 支持），脚本默认用 PATH 里的 mysql；需要时用 --mysql-cli 指定完整路径。
+if ! command -v "$MYSQL_CLI" >/dev/null 2>&1 && [ ! -x "$MYSQL_CLI" ]; then
+  echo "✗ 找不到 mysql 客户端：$MYSQL_CLI" >&2
+  echo "    用 --mysql-cli=<完整路径> 指定，例如：--mysql-cli=/usr/local/mysql/bin/mysql" >&2
+  echo "    或设环境变量：MYSQL_CLI=/usr/local/mysql/bin/mysql bash percona/truncate_all_tables.sh ..." >&2
+  exit 2
+fi
 if [ "$DRY_RUN" -eq 0 ] && [ "$YES" -eq 0 ]; then
   echo "拒绝执行：这会逐表清空数据（每张表一次 schema transition，epoch 会 +N）。" >&2
   echo "  先看清单：加 --dry-run；确认后改成 --yes。" >&2
@@ -143,6 +152,8 @@ if [ $preflight_rc -ne 0 ] || [ "$preflight_out" != "1" ]; then
   echo "    · caching_sha2_password + 非 TLS：加 --mysql-cli-args=\"--get-server-public-key\"" >&2
   echo "    · 要求 TLS：--mysql-cli-args=\"--ssl-mode=REQUIRED\"" >&2
   echo "    · 端口/主机写错：mysql -h${LEADER_HOST} -P${LEADER_PORT} -u${USER} -p -e 'SELECT 1'" >&2
+  echo "    · 客户端太旧/不支持 TLS 或 caching_sha2：换 MySQL 自带客户端试" >&2
+  echo "      --mysql-cli=/usr/local/mysql/bin/mysql" >&2
   exit 2
 fi
 
