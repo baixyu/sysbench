@@ -269,6 +269,8 @@ local VARS = {
    {"Percona_raft_read_index_peer_timing", "s"},
    {"Percona_raft_build_id", "s"},
    {"Percona_raft_receipt_reclaim_breakdown", "s"},
+   -- Appended to preserve existing TSV column positions.
+   {"Percona_raft_journal_compaction_segmented_breakdown", "s"},
 }
 
 local TYPE_OF = {}
@@ -1670,6 +1672,8 @@ local function cmd_summarize()
                rewrite_bytes = num("Percona_raft_journal_compaction_last_rewrite_bytes", i),
                rewrite_us = num("Percona_raft_journal_compaction_last_rewrite_us", i),
                total_us = num("Percona_raft_journal_compaction_last_total_us", i),
+               segmented = series["Percona_raft_journal_compaction_segmented_breakdown"] and
+                  series["Percona_raft_journal_compaction_segmented_breakdown"][i],
             }
          end
       end
@@ -1688,6 +1692,9 @@ local function cmd_summarize()
             tostring(event.scan_bytes or "n/a"), (event.scan_us or 0) / 1000,
             tostring(event.rewrite_bytes or "n/a"), (event.rewrite_us or 0) / 1000,
             (event.total_us or 0) / 1000, shown_window(pre), shown_window(post)))
+         if event.segmented and event.segmented ~= "" then
+            print("    segmented phases (us): " .. event.segmented)
+         end
       end
       if missed > 0 then
          print(string.format("  注意：采样间隔内还有 %d 次成功折叠没有单独的 last-* 明细；缩短 --interval-ms 可避免遗漏。", missed))
