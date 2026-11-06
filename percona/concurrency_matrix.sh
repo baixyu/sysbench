@@ -29,11 +29,12 @@
 #   linro  oltp_point_select --read-consistency=linearizable（强读）
 #   wo     oltp_write_only
 #   rw     oltp_read_write
+#   ui     oltp_update_index（只更新二级索引列，写场景）
 #
 # 选项：
 #   --threads=4,8,16,32,64,128  并发梯度（也接受 4-128:2 这种写法）
 #   --time=60                   每个组合跑多少秒
-#   --scenarios=ro,linro,wo,rw  只跑其中几个
+#   --scenarios=ro,linro,wo,rw,ui  只跑其中几个
 #   --out-root=/tmp/raft-conc   产物根目录（自动按时间戳建子目录）
 #   --settle=5                  组合之间等待秒数（让集群回稳）
 #   --skip-preflight            跳过"表是否齐全/行数是否匹配"的预检
@@ -56,7 +57,7 @@ LEADER_HOST=127.0.0.1; LEADER_PORT=; LEADER_USER=; LEADER_PASSWORD=
 DB=; TABLES=; TABLE_SIZE=
 THREADS_SPEC="4,8,16,32,64,128"
 TIME_S=60
-SCENARIO_SPEC="ro,linro,wo,rw"
+SCENARIO_SPEC="ro,linro,wo,rw,ui"
 OUT_ROOT=/tmp/raft-conc
 INTERVAL_MS=500; RING_INTERVAL_MS=250
 HOST_METRICS=0; NODE_EXPORTER_PORT=9100; PROMETHEUS_URL=
@@ -127,8 +128,13 @@ scenario_lua() {
     ro|linro) echo "src/lua/oltp_point_select.lua";;
     wo)       echo "src/lua/oltp_write_only.lua";;
     rw)       echo "src/lua/oltp_read_write.lua";;
+    ui)       echo "src/lua/oltp_update_index.lua";;
     *) return 1;;
   esac
+}
+# 写场景：会占用写许可、受 percona-raft-write-concurrency 约束
+is_write_scenario() {
+  case "$1" in wo|rw|ui) return 0;; *) return 1;; esac
 }
 scenario_extra() {
   case "$1" in
@@ -142,11 +148,12 @@ scenario_desc() {
     linro) echo "强读点查（LINEARIZABLE）";;
     wo)    echo "只写";;
     rw)    echo "读写混合";;
+    ui)    echo "索引列更新（oltp_update_index）";;
   esac
 }
 
 for sc in ${SCENARIO_SPEC//,/ }; do
-  scenario_lua "$sc" >/dev/null || { echo "未知场景：${sc}（可用 ro,linro,wo,rw）" >&2; exit 2; }
+  scenario_lua "$sc" >/dev/null || { echo "未知场景：${sc}（可用 ro,linro,wo,rw,ui）" >&2; exit 2; }
 done
 
 STAMP=$(date +%Y%m%d-%H%M%S)
@@ -207,7 +214,7 @@ if [[ "$SKIP_PREFLIGHT" -eq 0 && "$DRY_RUN" -eq 0 ]]; then
         echo "              建议 --percona-raft-apply-concurrency=8..32（workers 跟随或 >= 它），并把 caught-up-wait-us 调到 1-2s。" >&2
       fi
       for sc0 in ${SCENARIO_SPEC//,/ }; do
-        case "$sc0" in wo|rw) ;; *) continue;; esac
+        is_write_scenario "$sc0" || continue
         for t0 in ${THREADS//,/ }; do
           if [[ "$t0" -gt "$PERMIT_BOUND" ]]; then
             echo "    预检警告：$sc0 的 threads=$t0 超过写许可上限 $PERMIT_BOUND ⇒ 服务端会排队 ${PERMIT_WAIT:-?}us 后拒绝，客户端看到 3098。" >&2

@@ -489,7 +489,8 @@ bash percona/concurrency_matrix.sh \
   --out-root=/tmp/raft-conc
 ```
 
-- 场景：`ro`（点查）/ `linro`（点查 LINEARIZABLE 强读）/ `wo`（只写）/ `rw`（读写混合）；
+- 场景：`ro`（点查）/ `linro`（点查 LINEARIZABLE 强读）/ `wo`（只写）/ `rw`（读写混合）/
+  `ui`（`oltp_update_index`：只更新二级索引列，属写场景，受写许可上限约束）；
 - 并发梯度：`4,8,16,32,64,128` 或 `4-128:2`（两端含、按倍率展开）；
 - 产物（`--out-root/<时间戳>/`）：`matrix.tsv` / `matrix.md`（全矩阵），
   `<scenario>/<scenario>-summary.tsv`（单场景梯度），`<scenario>/t<NNN>/`（该组合的全部 monitor 原始数据 + `command.log` + `run.txt`）；
@@ -523,6 +524,22 @@ bash percona/truncate_all_tables.sh --schema-db=$DB --table-prefix=sbtest --tabl
 - 不加 `--yes` 且不是 `--dry-run` 时**拒绝执行**（防误清）。
 
 清空后要重新灌数：`prepare.sh --skip-ddl`（表已存在且为空，符合"只灌空表"的前置）。
+
+### 5.6.1 连表一起删掉：`percona/drop_all_tables.sh`
+
+和 truncate 版同构，只是 SQL 换成 `DROP TABLE`（每次 DROP 是一次 transition ⇒ manifest 收缩、epoch +1）：
+
+```bash
+bash percona/drop_all_tables.sh --schema-db=$DB --table-prefix=sbtest \
+  --member 10.188.62.79:6606 --member 10.214.38.209:6606 --member 10.188.48.140:6606 \
+  --user=root --password=root --dry-run     # 先看清单；确认后把 --dry-run 换成 --yes
+```
+
+- **默认 `--discover`**：从 information_schema 列出当前真实存在的 `<prefix>N` 表（DROP 只对存在的表有意义）；
+  显式给 `--tables=N` 时也会先过滤掉不存在的表；
+- 每条等价于 `SELECT PERCONA_RAFT_SCHEMA_TRANSITION('DROP TABLE `db`.`sbtestN`');`；
+- 全删完后 manifest 为空，要重建就跑 `percona/prepare.sh`（逐张 transition + 灌数）；
+- 安全与前缀相同：非 `--dry-run` 必须给 `--yes`；`--wait-members=SEC` 等各成员 epoch 追平。
 
 ## 6. 验收命令集
 
