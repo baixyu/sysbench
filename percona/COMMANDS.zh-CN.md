@@ -380,7 +380,7 @@ bash percona/raft_schema.sh --sysbench=$SB --schema-db=perf --schema-tables=t,t2
 ```bash
 bash percona/monitor.sh --sysbench=$SB \
   --member 10.188.62.79:6606 --member 10.214.38.209:6606 --member 10.188.48.140:6606 \
-  --user=root --password='root' --interval-ms=1000 --lock-waits --lock-interval-ms=250 \
+  --user=root --password='root' --interval-ms=1000 --network-probes --lock-waits --lock-interval-ms=250 \
   --out-dir=/tmp/raft-mon --tag=load \
   -- bash percona/prepare.sh --sysbench=$SB --schema-db=test --mysql-db=test ...
 ```
@@ -397,6 +397,16 @@ bash percona/monitor.sh --sysbench=$SB \
 - `--ring-interval-ms` 控制事件轮询，默认 250ms。服务端事件环有界，轮询间隔内若新增事件超过环容量仍可能丢事件；
   JSONL 会对多次快照去重。`--print-full` 把合并报告也打到屏幕上。wrapper 检查采样文件表头含目标端口和服务端主机名；
   `raft_monitor sample` 自己也会拒绝写进"已是另一台写的"文件。
+- 被包命令非零退出后，默认继续采集 300 秒，记录首个写错误之后的成员/网络变化；可用
+  `--post-failure-seconds=N` 调整，传 0 立即停止。成功退出不增加等待时间。
+- 加 `--network-probes` 后，每秒从压测机连接每个成员的 SQL 端口；生成
+  `<tag>-tcp-probes.jsonl` 和合并报告中的按目标统计。要探测真实 Raft listener，可按集群 `Percona_raft_configuration`
+  里的 endpoint 重复传 `--raft-member HOST:PORT`；如果所有节点 Raft 端口相同，也可传 `--raft-probe-ports=PORT`，它会
+  把该端口加到每个 `--member` 的主机上。默认不猜 Raft 端口。
+  `--network-probe-interval-ms` / `--network-probe-timeout-ms` 调整频率和连接超时，或用
+  `--no-network-probes` 关闭（默认关闭，避免对服务端额外建立短连接）。探测只做 TCP connect，不执行 SQL 或 TLS 握手；它描述的是压测机到节点的路径，
+  不能单独证明节点之间的路径正常。leader 的 `Percona_raft_peer_raft_state` 会另行汇总每个 peer 的响应年龄、
+  matched 位点差及超过 6 秒的样本。
 - 主机指标默认关闭。加 `--host-metrics` 后，压测机通过 HTTP 拉取 Node Exporter 或 Prometheus 指标，不使用 SSH：
   `--node-exporter-port=9100` 指定默认 Node Exporter 端口；`--node-exporter-url HOST=URL` 可为某节点覆盖指标地址
   （URL 是 exporter 根地址，例如 `http://node-metrics:9100`）；若使用 Prometheus，传 `--prometheus-url=http://prom:9090`，
@@ -404,9 +414,15 @@ bash percona/monitor.sh --sysbench=$SB \
   默认 1000ms。Prometheus/Node Exporter 端点需要能从压测机通过 HTTP 访问。
 - 主机原始数据写入 `<tag>-host-<host>.tsv`，采集错误写入同名 `.tsv.log`；不可达或缺少对应 exporter 指标时只影响主机数据，
   不会中断被包负载。采集 CPU 忙碌率与 iowait、load1、runnable/blocked 进程数、context switch 速率、调度等待时间、CPU PSI，
-  可用内存、磁盘读写速率/IOPS/利用率/await、网络吞吐与丢包、TCP 重传。调度等待/CPU PSI 受 Linux 内核和 Node Exporter collector
-  配置影响，指标缺失时对应列留空。主机指标适合并行 apply 压测时判断是否有 CPU/调度压力。
-  磁盘统计排除 loop、dm、md 及分区设备；网络统计排除 loopback 与常见容器虚拟接口；TCP 重传依赖 Node Exporter 的 netstat collector。
+  可用内存、磁盘读写速率/IOPS/利用率/await、每网卡收发字节/包、errors/drops、FIFO/frame/carrier/collision 计数、
+  carrier 变化和链路速度；TCP 重传、
+  建连失败、established reset、出站 RST、listen drop/overflow、接收队列/backlog/SYN 队列丢弃、syncookie、超时/abort、
+  当前 socket 状态、TCP 内存页数及 conntrack 使用量；softnet processed/dropped/times_squeezed 和 backlog 长度用于识别
+  内核网络收包队列压力。
+  网络按网卡的细项保存在末尾 `net_interfaces_json` 列，合并报告按网卡汇总，并给出 TCP/socket/conntrack/softnet 队列状态峰值。
+  调度等待/CPU PSI、TCP 扩展计数、conntrack
+  和 softnet 受 Linux 内核及 Node Exporter collector 配置影响，指标缺失时对应列留空。磁盘统计排除 loop、dm、md 及分区设备；
+  网络统计排除 loopback 与常见容器虚拟接口；TCP 指标依赖 Node Exporter 的 netstat/sockstat collector。
 - 看什么：`post_commit_gap_p95_us`（提交完成→本机 apply 的空档）、`max_apply_lag` / `max_durable_lag`
   （本机游标落后 commit 的峰值）、`max_quorum_lag`（leader 侧）、`unknown_delta`（结果未定）。
   三台并排时，**谁的 lag 大就是那条腿**。

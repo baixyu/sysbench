@@ -33,6 +33,12 @@ NODE_EXPORTER_PORT=9100
 PROMETHEUS_URL=
 NODE_EXPORTER_URLS=()
 PROMETHEUS_INSTANCES=()
+NETWORK_PROBES=0
+RAFT_PROBE_PORTS=
+RAFT_MEMBERS=()
+NETWORK_PROBE_INTERVAL_MS=1000
+NETWORK_PROBE_TIMEOUT_MS=300
+POST_FAILURE_SECONDS=300
 OUT_DIR=
 TAG=mon
 PRINT_FULL=0
@@ -58,6 +64,13 @@ while [[ $# -gt 0 ]]; do
     --node-exporter-url) NODE_EXPORTER_URLS+=("$2"); shift 2;;
     --prometheus-url) PROMETHEUS_URL=$2; shift 2;;
     --prometheus-instance) PROMETHEUS_INSTANCES+=("$2"); shift 2;;
+    --network-probes) NETWORK_PROBES=1; shift;;
+    --no-network-probes) NETWORK_PROBES=0; shift;;
+    --raft-probe-ports) RAFT_PROBE_PORTS=$2; shift 2;;
+    --raft-member) RAFT_MEMBERS+=("$2"); shift 2;;
+    --network-probe-interval-ms) NETWORK_PROBE_INTERVAL_MS=$2; shift 2;;
+    --network-probe-timeout-ms) NETWORK_PROBE_TIMEOUT_MS=$2; shift 2;;
+    --post-failure-seconds) POST_FAILURE_SECONDS=$2; shift 2;;
     --out-dir) OUT_DIR=$2; shift 2;;
     --tag) TAG=$2; shift 2;;
     --print-full) PRINT_FULL=1; shift;;
@@ -75,6 +88,13 @@ if [[ "$LOCK_WAITS" -eq 1 && ( ! "$LOCK_INTERVAL_MS" =~ ^[0-9]+$ || "$LOCK_INTER
   echo "--lock-interval-ms 必须是 >= 100 的整数" >&2
   exit 2
 fi
+[[ "$POST_FAILURE_SECONDS" =~ ^[0-9]+$ ]] || { echo "--post-failure-seconds 必须是非负整数" >&2; exit 2; }
+[[ "$NETWORK_PROBE_INTERVAL_MS" =~ ^[0-9]+$ && "$NETWORK_PROBE_INTERVAL_MS" -ge 100 ]] || {
+  echo "--network-probe-interval-ms 必须是 >= 100 的整数" >&2; exit 2;
+}
+[[ "$NETWORK_PROBE_TIMEOUT_MS" =~ ^[0-9]+$ && "$NETWORK_PROBE_TIMEOUT_MS" -gt 0 ]] || {
+  echo "--network-probe-timeout-ms 必须是正整数" >&2; exit 2;
+}
 
 conn_args=(--mysql-user="$USER" --mysql-db=mysql)   # 采样不依赖业务库
 [[ -n "$PASSWORD" ]] && conn_args+=(--mysql-password="$PASSWORD")
@@ -99,6 +119,8 @@ ring_pids=()
 lock_pids=()
 host_pids=()
 host_files=()
+network_probe_pid=
+network_probe_file=
 start_samplers() {
   local m host port tsv lock_file suffix i=0
   for m in "${MEMBERS[@]}"; do
@@ -175,6 +197,22 @@ start_host_monitors() {
   done
 }
 
+start_network_probes() {
+  [[ "$NETWORK_PROBES" -eq 1 ]] || return 0
+  command -v python3 >/dev/null 2>&1 || { echo "[monitor] TCP 探测需要压测机上的 python3，主动探测未启动" >&2; return 0; }
+  network_probe_file="$OUT_DIR/${TAG}-tcp-probes.jsonl"
+  rm -f "$network_probe_file" "$network_probe_file.stop"
+  local args=(--out "$network_probe_file" --interval-ms "$NETWORK_PROBE_INTERVAL_MS"
+              --timeout-ms "$NETWORK_PROBE_TIMEOUT_MS")
+  [[ -z "$RAFT_PROBE_PORTS" ]] || args+=(--raft-ports "$RAFT_PROBE_PORTS")
+  local m
+  for m in "${MEMBERS[@]}"; do args+=(--member "$m"); done
+  for m in "${RAFT_MEMBERS[@]}"; do args+=(--raft-member "$m"); done
+  python3 "$here/network_probe.py" "${args[@]}" > "$OUT_DIR/${TAG}-tcp-probes.log" 2>&1 &
+  network_probe_pid=$!
+  echo "  [monitor] TCP 探测启动：压测机 → member SQL/Raft ports → $network_probe_file"
+}
+
 stop_samplers() {
   local m tsv
   for m in "${MEMBERS[@]}"; do
@@ -185,21 +223,25 @@ stop_samplers() {
   done
   local f
   for f in "${host_files[@]:-}"; do : > "$f.stop"; done
+  if [[ -n "$network_probe_file" ]]; then : > "$network_probe_file.stop"; fi
   local pid
   for pid in "${sampler_pids[@]:-}"; do [[ -n "$pid" ]] && wait "$pid" 2>/dev/null; done
   for pid in "${ring_pids[@]:-}"; do [[ -n "$pid" ]] && wait "$pid" 2>/dev/null; done
   for pid in "${lock_pids[@]:-}"; do [[ -n "$pid" ]] && wait "$pid" 2>/dev/null; done
   for pid in "${host_pids[@]:-}"; do [[ -n "$pid" ]] && wait "$pid" 2>/dev/null; done
+  if [[ -n "$network_probe_pid" ]]; then wait "$network_probe_pid" 2>/dev/null; fi
   sampler_pids=()
   ring_pids=()
   lock_pids=()
   host_pids=()
+  network_probe_pid=
 }
 trap 'stop_samplers' EXIT
 
 echo "=== monitor：$(date +%T) 开始，输出目录 $OUT_DIR ==="
 start_samplers
 start_host_monitors
+start_network_probes
 sleep 1
 
 echo "=== 跑被包的命令：${CMD[*]} ==="
@@ -211,7 +253,11 @@ set -o pipefail
   if [[ "$line" == *tps:* && "$line" == *lat* ]]; then printf '%s\t%s\n' "$ts_now" "$line" >> "$OUT_DIR/client-intervals.tsv"; fi
 done
 rc=${PIPESTATUS[0]}
-echo "=== 命令结束（rc=${rc}），停止采样并汇总 ==="
+echo "=== 命令结束（rc=${rc}） ==="
+if [[ "$rc" -ne 0 && "$POST_FAILURE_SECONDS" -gt 0 ]]; then
+  echo "=== 被包命令失败，继续采集 ${POST_FAILURE_SECONDS}s 以记录后续成员/网络变化 ==="
+  sleep "$POST_FAILURE_SECONDS"
+fi
 stop_samplers
 
 for m in "${MEMBERS[@]}"; do
@@ -251,6 +297,7 @@ COMBINED="$OUT_DIR/${TAG}-combined.txt"
     fi
   done
   for f in "${host_files[@]:-}"; do echo "# 主机指标：$f；日志：$f.log"; done
+  [[ -z "$network_probe_file" ]] || echo "# TCP 探测：$network_probe_file（从压测机探测成员 SQL/Raft 端口）"
   echo
   echo "## 三台并排"
   for m in "${MEMBERS[@]}"; do
@@ -262,7 +309,14 @@ COMBINED="$OUT_DIR/${TAG}-combined.txt"
     for f in "${host_files[@]}"; do
       echo "### $f"
       awk -F '\t' 'NR > 1 && $3 != "" { n++; cpu += $3; if ($4 > iowait) iowait = $4; if (!have_mem || $5 < min_mem) { min_mem = $5; have_mem = 1 } if ($10 > disk_util) disk_util = $10; if ($11 > disk_await) disk_await = $11; drops += $15; retrans += $16; if ($17 != "") { load += $17; if ($17 > load_max) load_max = $17; } if ($18 > procs_running) procs_running = $18; if ($19 > procs_blocked) procs_blocked = $19; ctxt += $20; sched_wait += $21; if ($22 > cpu_psi) cpu_psi = $22 } END { if (!n) print "samples=0（尚无完整计数器区间；检查同名 .log）"; else printf "samples=%d cpu_busy_avg=%.2f%% iowait_max=%.2f%% memavailable_min=%.0f disk_util_max=%.2f%% disk_await_max=%.2fms net_drops_delta=%.0f tcp_retrans_delta=%.0f load1_avg=%.2f load1_max=%.2f procs_running_max=%.0f procs_blocked_max=%.0f context_switches_avg_per_s=%.0f sched_wait_cpu_avg_core_s_per_s=%.3f cpu_psi_some_max=%.2f%%\n", n, cpu/n, iowait, min_mem, disk_util, disk_await, drops, retrans, load/n, load_max, procs_running, procs_blocked, ctxt/n, sched_wait/n, cpu_psi }' "$f"
+      python3 "$here/host_monitor.py" --summarize "$f" 2>/dev/null || true
     done
+    echo
+  fi
+  if [[ -n "$network_probe_file" && -s "$network_probe_file" ]]; then
+    echo "## TCP port probes (from $(hostname))"
+    python3 "$here/network_probe.py" --summarize "$network_probe_file" 2>/dev/null || true
+    echo "raw=$network_probe_file"
     echo
   fi
   echo "## 逐台完整汇总"

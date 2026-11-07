@@ -1457,6 +1457,69 @@ local function cmd_summarize()
       print("  首: " .. (series["Percona_raft_local_raft_state"][1] or ""))
       print("  末: " .. (series["Percona_raft_local_raft_state"][n] or ""))
    end
+   -- Preserve the leader's per-peer Raft response age and matched index as a
+   -- compact summary. These are the server-side view of peer connectivity; the
+   -- host TCP probes below are sourced from the benchmark machine instead.
+   local peer_raft = series["Percona_raft_peer_raft_state"]
+   if peer_raft then
+      local peers = {}
+      for i = 1, n do
+         for id, body in (peer_raft[i] or ""):gmatch("id(%d+)%{([^}]*)%}") do
+            local fields = {}
+            for key, value in body:gmatch("([%w_]+):([^%s}]+)") do fields[key] = tonumber(value) end
+            local peer = peers[id]
+            if not peer then
+               peer = {samples = 0, dead_samples = 0}
+               peers[id] = peer
+            end
+            peer.samples = peer.samples + 1
+            local age = fields.resp_age_us
+            if age ~= nil then
+               if peer.max_resp_age_us == nil or age > peer.max_resp_age_us then
+                  peer.max_resp_age_us, peer.max_resp_age_at = age, i
+               end
+               if age >= 6000000 then
+                  peer.dead_samples = peer.dead_samples + 1
+                  peer.first_dead_at = peer.first_dead_at or i
+                  peer.last_dead_at = i
+               end
+               peer.last_resp_age_us = age
+            end
+            local last_log, matched = fields.last_log, fields.matched
+            if last_log ~= nil and matched ~= nil then
+               local gap = math.max(0, last_log - matched)
+               if peer.max_log_match_gap == nil or gap > peer.max_log_match_gap then
+                  peer.max_log_match_gap, peer.max_log_match_gap_at = gap, i
+               end
+               peer.last_log, peer.last_matched = last_log, matched
+            end
+            peer.last_ack_term = fields.ack_term
+         end
+      end
+      local ids = {}
+      for id in pairs(peers) do ids[#ids + 1] = id end
+      table.sort(ids, function(a, b) return tonumber(a) < tonumber(b) end)
+      if #ids > 0 then
+         print("\n-- Raft peer heartbeat / replication（leader 本机视角）--")
+         for _, id in ipairs(ids) do
+            local peer = peers[id]
+            local age_ms = peer.max_resp_age_us and peer.max_resp_age_us / 1000 or 0
+            local last_age_ms = peer.last_resp_age_us and peer.last_resp_age_us / 1000 or 0
+            local time_at = peer.max_resp_age_at and os.date("!%Y-%m-%dT%H:%M:%SZ", math.floor(ts_all[peer.max_resp_age_at])) or "n/a"
+            local dead_window = ""
+            if peer.first_dead_at then
+               dead_window = string.format(" >6s_samples=%d first=%s last=%s",
+                  peer.dead_samples,
+                  os.date("!%Y-%m-%dT%H:%M:%SZ", math.floor(ts_all[peer.first_dead_at])),
+                  os.date("!%Y-%m-%dT%H:%M:%SZ", math.floor(ts_all[peer.last_dead_at])))
+            end
+            print(string.format("  peer_id=%s samples=%d max_resp_age=%.1fms at=%s last_resp_age=%.1fms max_log_match_gap=%s last_log=%s last_matched=%s ack_term=%s%s",
+               id, peer.samples, age_ms, time_at, last_age_ms,
+               tostring(peer.max_log_match_gap or "n/a"), tostring(peer.last_log or "n/a"),
+               tostring(peer.last_matched or "n/a"), tostring(peer.last_ack_term or "n/a"), dead_window))
+         end
+      end
+   end
    local detail_states = {
       "Percona_raft_apply_schedule_state", "Percona_raft_apply_stage_breakdown",
       "Percona_raft_receipt_lookup_breakdown", "Percona_raft_receipt_reclaim_breakdown",
