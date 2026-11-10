@@ -255,6 +255,8 @@ $SB src/lua/raft_monitor.lua --mysql-host=127.0.0.1 --mysql-port=$LEADER --mysql
 # 持续采集 recent_events（同名 .stop 文件出现即停；先建立基线，只收集本次运行的新事件）
 $SB src/lua/raft_monitor.lua --mysql-host=127.0.0.1 --mysql-port=$LEADER --mysql-user=root \
   --mysql-db=mysql ring-watch --out=/tmp/m.events.jsonl --interval-ms=250
+# 同一命令还会把慢事件（PERCONA_RAFT_SLOW_EVENTS()，>=100 ms）单独写到 /tmp/m.events.slow.jsonl；
+# 慢事件环在服务端有 1,024 条、不受 256 条 recent_events 环淘汰影响，所以秒级停顿只能从这份文件归因。
 # 可选：采样当前 InnoDB 锁等待；等待结束时写出一条记录，停止时仍在等待的记录标为 right_censored
 $SB src/lua/raft_monitor.lua --mysql-host=127.0.0.1 --mysql-port=$LEADER --mysql-user=root \
   --mysql-db=mysql lock-watch --out=/tmp/m.lock-waits.jsonl --lock-interval-ms=250
@@ -309,6 +311,11 @@ $SB src/lua/oltp_write_only.lua --mysql-host=127.0.0.1 --mysql-port=$LEADER \
   文件打开/关闭、编码和首次建文件时的目录同步等 writer 路径工作；这些是嵌套计时，不能彼此相加。各项是成员本地计时，
   不把跨节点延迟归到某个单一事务。
 - recent event 带服务端递增序号。`ring-watch` 会检测两次轮询之间的序号缺口，并在汇总中输出事件覆盖状态、漏失数、服务重启数和轮询错误。
+- **慢事件单独落盘**：`recent_events` 环只有 256 条，在 2,650 提交/s（每笔约 10 个阶段，约 26,500 事件/s）下只覆盖不到 10 ms，
+  实测 2 小时压测漏失 96.4%（190,797,080 条只取到 6,950,400），且落盘文件里**没有任何一条 `duration_us >= 100,000` 的事件**——
+  秒级停顿因此无法归因。现在服务端另有一个只收 `>=100 ms` 事件的深环（1,024 条），由 `ring-watch` 同步轮询并写到
+  `<out 去掉 .jsonl>.slow.jsonl`（可用 `--slow-out` 改名），按 `event_epoch:event_seq` 去重；`summarize` 读到该旁路文件时
+  会额外打印「慢事件（>=100 ms）」一节，按 stage 给出条数与最大耗时。旧服务端没有该函数时会打印 `slow_supported=0` 并跳过。
   `incomplete` 时阶段 p99 只代表已收集样本；`unknown` 表示无法证明完整（例如旧服务端没有序号，或采集中服务重启）。服务端的
   `Percona_raft_observability_events_evicted` 是事件环累计覆盖数；事件已被 watcher 及时保存后仍可能计入覆盖数，实际采集漏失以序号缺口为准。
 - Freeze 前后客户端 p99 从 `monitor.sh` 生成的 `client-intervals.tsv` 读取。压测命令需使用 `--report-interval=1 --percentile=99`；
@@ -387,7 +394,8 @@ bash percona/monitor.sh --sysbench=$SB \
 
 - `--` 之后是要包住的命令（`prepare.sh`、原生 sysbench 负载、任何命令都行）；**退出码 = 被包命令的退出码**。
 - 产物（文件名**按 host_port 唯一**）：`<tag>-<host>_<port>.tsv`（状态量原始采样）、`.events.jsonl`
-  （负载期间轮询到的新 recent_events）、`.summary.txt`（逐台完整判读）、`.sample.log` / `.ring-watch.log`、
+  （负载期间轮询到的新 recent_events）、**`.events.slow.jsonl`（慢事件 >=100 ms，独立深环，不会被淘汰）**、
+  `.summary.txt`（逐台完整判读）、`.sample.log` / `.ring-watch.log`、
   `command.log`（被包命令原样输出）、`phase-markers.tsv`（以 `===` 开头的流程阶段及时间）、
   `client-intervals.tsv`（sysbench 输出的区间 TPS/QPS/延迟行），以及 **`<tag>-combined.txt`：三台并排 +
   逐台完整汇总的合并报告**。要采集 freeze 前后客户端 p99，被包的 sysbench 命令需开启 `--report-interval=1 --percentile=99`。

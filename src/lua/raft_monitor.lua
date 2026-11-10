@@ -11,6 +11,10 @@
 --   sample     按间隔把状态量追加到 TSV（同名的 <out>.stop 文件出现即停；--duration-s 也可停）
 --   ring       把 PERCONA_RAFT_RECENT_EVENTS() 的 JSON 落到文件（供 summarize 算分阶段分布）
 --   ring-watch 压测期间持续轮询有界事件环，追加去重事件到 JSONL
+--               同时把 PERCONA_RAFT_SLOW_EVENTS() 的慢事件（>=100 ms）单独落到
+--               <out 去掉 .jsonl>.slow.jsonl：256 条的 recent_events 环在 2,650 提交/s
+--               （每笔约 10 个阶段）下只覆盖不到 10 ms，实测漏失 96.4%、
+--               且没有一条 >=100 ms 的事件，秒级停顿只能靠这条独立通道留证。
 --   lock-watch 压测期间采样 performance_schema.data_lock_waits，输出等待方/阻塞方 JSONL
 --   summarize  读 TSV（可带 ring JSON），打印汇总 + 判读（verdict）
 --
@@ -30,6 +34,7 @@ sysbench.cmdline.options = {
    out = {"sample：TSV 输出路径（同名 .stop 文件 = 停止开关）；ring：JSON 输出路径", ""},
    in_file = {"summarize：要分析的 TSV", ""},
    ring_file = {"summarize：可选的 recent_events JSON/JSONL 文件", ""},
+   slow_out = {"ring-watch：慢事件单独落盘路径（默认 <out 去掉 .jsonl>.slow.jsonl）", ""},
    client_file = {"summarize：可选的 monitor.sh 客户端区间输出（用于 freeze 前后 p99）", ""},
    interval_ms = {"sample：采样间隔（毫秒）", 1000},
    lock_interval_ms = {"lock-watch：锁等待采样间隔（毫秒）", 250},
@@ -336,6 +341,15 @@ local function read_file(path)
    return text
 end
 
+-- 慢事件落盘路径：与 ring JSONL 同名，把 .jsonl 后缀换成 .slow.jsonl。
+local function slow_sidecar_path(jsonl_path)
+   return (tostring(jsonl_path):gsub("%.jsonl$", "")) .. ".slow.jsonl"
+end
+
+-- 与服务端 Raft_observability::kSlow_event_limit 对齐。一次轮询返回这么多条，
+-- 说明慢事件环已被填满（更早的慢事件正在被淘汰）。
+local SLOW_RING_LIMIT = 1024
+
 local function env_of(con)
    local host = con:query_row("SELECT @@hostname") or "?"
    local port = con:query_row("SELECT @@port") or "?"
@@ -502,7 +516,47 @@ local function cmd_ring_watch()
       end
       if fh then fh:flush() end
    end
+   -- 慢事件通道：独立函数 + 独立深环（服务端 1,024 条，只收 >=100 ms）。
+   -- 慢事件稀少（小时级个位数），所以用同一个轮询节奏就能整体落盘，
+   -- 不需要为它提高轮询频率（提高频率也救不了 500 ms 轮询的 256 条环）。
+   local slow_file = sysbench.opt.slow_out ~= "" and sysbench.opt.slow_out or slow_sidecar_path(sysbench.opt.out)
+   local slow_supported = pcall(function() return con:query_row("SELECT PERCONA_RAFT_SLOW_EVENTS()") end)
+   local slow_seen, slow_events, slow_saturated = {}, 0, false
+   local slow_fh = nil
+   if slow_supported then
+      local slow_err
+      slow_fh, slow_err = io.open(slow_file, "w")
+      if slow_fh == nil then
+         print(string.format("raft_monitor.warn=cannot_write_slow_out path=%s err=%s", slow_file, tostring(slow_err)))
+         slow_supported = false
+      end
+   end
+   local function remember_slow(baseline)
+      if not slow_supported then return end
+      local ok, snapshot = pcall(function() return con:query_row("SELECT PERCONA_RAFT_SLOW_EVENTS()") end)
+      if not ok or snapshot == nil then return end
+      local events = parse_ring(tostring(snapshot))
+      if #events >= SLOW_RING_LIMIT then slow_saturated = true end
+      for _, e in ipairs(events) do
+         local epoch, seq = tonumber(e.event_epoch), tonumber(e.event_seq)
+         local key
+         if epoch ~= nil and seq ~= nil then
+            key = string.format("%d:%d", epoch, seq)
+         else
+            key = identity(e)   -- 旧服务端没有 seq 时退化到内容身份
+         end
+         if not slow_seen[key] then
+            slow_seen[key] = true
+            if not baseline then
+               write_event(e, slow_fh)
+               slow_events = slow_events + 1
+            end
+         end
+      end
+      if slow_fh then slow_fh:flush() end
+   end
    remember(ring_snapshot(con), nil, true) -- 压测前基线
+   remember_slow(true)
    local fh, err = io.open(sysbench.opt.out, "w")
    if fh == nil then die("写不了 %s：%s", sysbench.opt.out, tostring(err)) end
    local count = 0
@@ -510,11 +564,13 @@ local function cmd_ring_watch()
       local poll_ok = pcall(function() remember(ring_snapshot(con), fh, false) end)
       if not poll_ok then poll_errors = poll_errors + 1 end
       count = count + 1
+      remember_slow(false)
       local f = io.open(stop_path, "r")
       if f then
          f:close()
          local final_ok = pcall(function() remember(ring_snapshot(con), fh, false) end)
          if not final_ok then poll_errors = poll_errors + 1 end
+         remember_slow(false)
          break
       end
       pcall(function() con:query_row(string.format("SELECT SLEEP(%.3f)", interval / 1000)) end)
@@ -529,9 +585,17 @@ local function cmd_ring_watch()
                           coverage_status, sequence_supported and "true" or "false",
                           observed_events, missed_events, sequence_resets, poll_errors))
    fh:close()
-   print(string.format("raft_monitor.ring_polls=%d coverage=%s observed=%d missed=%d resets=%d poll_errors=%d out=%s",
+   if slow_fh then
+      slow_fh:write(string.format('{"kind":"slow_coverage","supported":%s,"observed_slow_events":%d,"ring_saturated":%s}\n',
+                                  slow_supported and "true" or "false", slow_events,
+                                  slow_saturated and "true" or "false"))
+      slow_fh:close()
+   end
+   print(string.format("raft_monitor.ring_polls=%d coverage=%s observed=%d missed=%d resets=%d poll_errors=%d slow_supported=%d slow_events=%d out=%s slow_out=%s",
                        count, coverage_status, observed_events, missed_events,
-                       sequence_resets, poll_errors, sysbench.opt.out))
+                       sequence_resets, poll_errors,
+                       slow_supported and 1 or 0, slow_events,
+                       sysbench.opt.out, slow_supported and slow_file or "n/a"))
 end
 
 -- 采集当前 InnoDB data lock waits。等待在连续采样间保持为一条记录，解除时输出；
@@ -1680,6 +1744,41 @@ local function cmd_summarize()
          end
       else
          print("  事件覆盖：unknown（文件没有 ring-watch 覆盖记录）")
+      end
+      -- 慢事件（>=100 ms）：ring-watch 单独落盘的那份（同名 .slow.jsonl）。
+      -- 它不受 256 条环的淘汰影响，所以它的 n/max 是“完整的慢事件集”。
+      local slow_path = slow_sidecar_path(sysbench.opt.ring_file)
+      local sfh = io.open(slow_path, "r")
+      if sfh ~= nil then
+         local slow_text = sfh:read("*a")
+         sfh:close()
+         local slow_events = parse_ring(slow_text)
+         local slow_total, slow_max_us, by_stage_slow = 0, 0, {}
+         for _, e in ipairs(slow_events) do
+            local dur = tonumber(e.duration_us) or 0
+            slow_total = slow_total + 1
+            if dur > slow_max_us then slow_max_us = dur end
+            local st = tostring(e.stage or "?")
+            local rec = by_stage_slow[st] or { n = 0, max = 0 }
+            rec.n = rec.n + 1
+            if dur > rec.max then rec.max = dur end
+            by_stage_slow[st] = rec
+         end
+         print(string.format("\n-- 慢事件（>=100 ms，单独落盘 %s）--", slow_path))
+         if slow_text:find('"kind":"slow_coverage"') ~= nil and slow_text:find('"supported":false') ~= nil then
+            print("  服务端不支持 PERCONA_RAFT_SLOW_EVENTS()（旧二进制），本次没有慢事件通道。")
+         elseif slow_total == 0 then
+            print("  没有 >=100 ms 的事件（该通道按设计不会漏，不是环被淘汰）。")
+         else
+            print(string.format("  n=%d max=%.1fms", slow_total, slow_max_us / 1000))
+            local names = {}
+            for st in pairs(by_stage_slow) do names[#names + 1] = st end
+            table.sort(names, function(a, b) return by_stage_slow[a].max > by_stage_slow[b].max end)
+            for i = 1, math.min(#names, 10) do
+               print(string.format("  %-26s n=%d max=%.1fms", names[i],
+                                   by_stage_slow[names[i]].n, by_stage_slow[names[i]].max / 1000))
+            end
+         end
       end
       if proof_count > 0 then
          local shapes = {}

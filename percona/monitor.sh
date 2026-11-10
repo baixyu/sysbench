@@ -126,7 +126,8 @@ start_samplers() {
   for m in "${MEMBERS[@]}"; do
     host=${m%%:*}; port=${m##*:}; i=$((i + 1))
     tsv="$OUT_DIR/$(base_of "$m").tsv"
-    rm -f "$tsv.stop" "$OUT_DIR/$(base_of "$m").events.jsonl" "$OUT_DIR/$(base_of "$m").events.jsonl.stop"
+    rm -f "$tsv.stop" "$OUT_DIR/$(base_of "$m").events.jsonl" "$OUT_DIR/$(base_of "$m").events.jsonl.stop" \
+          "$OUT_DIR/$(base_of "$m").events.slow.jsonl" "$OUT_DIR/$(base_of "$m").events.slow.jsonl.stop"
     "$SYSBENCH" "$LUA" --mysql-host="$host" --mysql-port="$port" "${conn_args[@]}" \
       sample --out="$tsv" --interval-ms="$INTERVAL_MS" > "$OUT_DIR/$(base_of "$m").sample.log" 2>&1 &
     sampler_pids+=("$!")
@@ -144,7 +145,7 @@ start_samplers() {
     fi
     suffix=""
     [[ "$LOCK_WAITS" -eq 0 ]] || suffix=" + lock-waits.jsonl"
-    echo "  [monitor] 采样启动：$host:$port → $tsv + events.jsonl$suffix"
+    echo "  [monitor] 采样启动：$host:$port → $tsv + events.jsonl + events.slow.jsonl$suffix"
   done
   # 自检：文件得出现，且头里的 host/port 必须就是这台（串台当场发现，别等跑完才发现）
   local m2 host2 port2 tsv2 hdr
@@ -291,7 +292,7 @@ COMBINED="$OUT_DIR/${TAG}-combined.txt"
   echo "# 客户端区间输出：$OUT_DIR/client-intervals.tsv（需被包命令启用 sysbench --report-interval）"
   echo "# 阶段标记：$OUT_DIR/phase-markers.tsv"
   for m in "${MEMBERS[@]}"; do
-    echo "# 采样文件：$OUT_DIR/$(base_of "$m").tsv；事件：$OUT_DIR/$(base_of "$m").events.jsonl"
+    echo "# 采样文件：$OUT_DIR/$(base_of "$m").tsv；事件：$OUT_DIR/$(base_of "$m").events.jsonl；慢事件（>=100 ms）：$OUT_DIR/$(base_of "$m").events.slow.jsonl"
     if [[ "$LOCK_WAITS" -eq 1 ]]; then
       echo "# 锁等待：$OUT_DIR/$(base_of "$m").lock-waits.jsonl；日志：$OUT_DIR/$(base_of "$m").lock-watch.log"
     fi
