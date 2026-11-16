@@ -198,7 +198,10 @@ $SB src/lua/raft_prepare.lua --schema-db=perf --mysql-db=perf \
 ```
 
 形状相关开关：`--types=builtin|all`、`--index-profile=pk|pk_secondary`（默认 `pk`）、
-`--row-length=B`（`B>0` 时会加宽承载列 `c` 并让 `pad` 恒 60 字节参与口径）。
+`--row-length=B`：`builtin` 由 `c` 承载（`B>0` 时加宽 `c`，`pad` 恒 60 字节参与口径）；
+`all` 由 **`c_pad` BLOB** 承载（`c_varchar` 在 1–255 之间自适应），所以 `all` 能跑大行：
+`B` 最小约 312 字节，最大 4 GiB（≤16 MiB 用 `MEDIUMBLOB`，超出自动换 `LONGBLOB`）。
+例：`--types=all --row-length=262144`（256 KB 行）。
 
 ### 4.2 `raft_verify.lua`：跨成员核对（一般用 §5 的包装脚本）
 

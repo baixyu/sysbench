@@ -25,6 +25,9 @@
 --   （t-w, t, t+w 各一份 ⇒ 均值 = t），w = min(0.3t, n-t)，所以不会因为上界截断而偏低。
 --   填充内容是 ASCII（1 字符 = 1 字节）：utf8mb4 多字节内容会让"字符数 ≠ 字节数"，
 --   而算错的行长看不出来（AVG 只是偏了）。
+--   `--types=all` 的填充列是 `c_pad`（BLOB 家族）：VARCHAR 上限 65,535 字节，撑不到 256 KB；
+--   BLOB 在 DYNAMIC 行格式下走溢出页，声明长度只占行内 9–12 字节，所以行内 65,535 上限撞不到。
+--   目标 ≤ 16 MiB 用 MEDIUMBLOB，超出自动换 LONGBLOB（上限 4 GiB）。
 --
 
 if sysbench.cmdline.command == nil then
@@ -36,7 +39,7 @@ sysbench.cmdline.options = {
    table_prefix = {"表名前缀（表名 = <prefix>1..N）", "sbtest"},
    tables = {"建几张表（与 sysbench 的 --tables 同义）", 1},
    table_size = {"每张表多少行", 10000},
-   row_length = {"目标**平均**行长 B（列数据字节数，§5）；0 = 只用必需列", 0},
+   row_length = {"目标**平均**行长 B（列数据字节数，§5）；0 = 只用必需列；alltypes 由 c_pad BLOB 承载（上限 4 GiB）", 0},
    types = {"列类型档：builtin（少量常见列）| all（§4.1.1 全类型表）", "builtin"},
    index_profile = {"键结构：pk | pk_secondary", "pk"},
    seed = {"数据生成种子（两侧必须同一个，§4.4）", 42},
@@ -215,8 +218,9 @@ local function builtin_shape(b, profile)
 end
 
 -- all-types profile：照现场那张 app.alltypes（**31 列**，`SHOW CREATE TABLE` 抄下来的真实定义），
--- 覆盖除地理空间外的全部列类型。`--row-length` 由 `c_varchar` 承载（把它加宽到装得下目标），
--- **列数与类型面都不变**——只是同一个 VARCHAR 列更长。
+-- 覆盖除地理空间外的全部列类型。`--row-length` 由 `c_pad`（BLOB 家族）承载；`c_varchar` 保持
+-- VARCHAR(255) 继续覆盖该类型，**31 列的类型面一个不少**。
+-- 为什么不用 VARCHAR 承载：VARCHAR 上限 65,535 字节（utf8mb4 下 16,383 字符），256 KB 撑不进去。
 local ALLTYPES = {
    {name = "c_long",     ddl = "INT NOT NULL",              gen = function(id) return tostring(id) end},
    {name = "c_tiny",     ddl = "TINYINT",                   gen = function(id) return tostring(id % 100) end},
@@ -236,7 +240,9 @@ local ALLTYPES = {
    {name = "c_char",     ddl = "CHAR(10)",       var = 10,  gen = function(id, rng) return "'" .. ascii_of(rng, 10, "ch") .. "'" end},
    {name = "c_binary",   ddl = "BINARY(8)",      var = 8,   gen = function(id, rng) return "x'" .. hex_of(rng, 8, "bi") .. "'" end},
    -- 填充列：内容长度由 fill_lengths 决定（值函数放在 shape 里覆盖）
-   {name = "c_varchar",  ddl = "VARCHAR(%d)",    var = 0,   gen = nil},
+   {name = "c_varchar",  ddl = "VARCHAR(%d)",    var = 255, gen = function(id, rng) return "'" .. ascii_of(rng, 255, "vr") .. "'" end},
+   -- 填充列：内容长度由 fill_lengths 决定（值函数放在 shape 里覆盖）
+   {name = "c_pad",      ddl = "MEDIUMBLOB",    var = 0,   gen = nil},
    {name = "c_varbinary",ddl = "VARBINARY(100)", var = 20,  gen = function(id, rng) return "x'" .. hex_of(rng, 20, "vb") .. "'" end},
    {name = "c_tinytext", ddl = "TINYTEXT",       var = 12,  gen = function(id, rng) return "'" .. ascii_of(rng, 12, "tt") .. "'" end},
    {name = "c_text",     ddl = "TEXT",           var = 24,  gen = function(id, rng) return "'" .. ascii_of(rng, 24, "tx") .. "'" end},
@@ -255,10 +261,15 @@ local ALLTYPES = {
    {name = "c_set",      ddl = "SET('x','y','z')", var = 1,  gen = function(id) return "'" .. ({"x","y","z"})[(id % 3) + 1] .. "'" end},
 }
 
+-- 填充列：用 BLOB 家族承载大行（DYNAMIC 行格式下走溢出页）。
+local FILL = "c_pad"
+local FILL_MEDIUMBLOB_MAX = 16777215      -- MEDIUMBLOB 上限
+local FILL_LONGBLOB_MAX = 4294967295      -- LONGBLOB 上限
+
 local function alltypes_shape(b, profile)
    -- 定宽部分：ALLTYPES 里没有 var 字段的都是定宽（数值/时间）
    local fixed = 0
-   local var_known = 0
+   local var_others = 0
    for _, c in ipairs(ALLTYPES) do
       if c.var == nil then
          local w = FIXED_BYTES[c.name]
@@ -266,10 +277,19 @@ local function alltypes_shape(b, profile)
             die("内部错误：列 %s 没有声明宽度（alltypes 的定宽表漏了）", c.name)
          end
          fixed = fixed + w
-      elseif c.name ~= "c_varchar" then
-         var_known = var_known + c.var
+      elseif c.name ~= FILL and c.name ~= "c_varchar" then
+         -- 内容长度固定的变长列（c_char / 各 text/blob / json / bit / enum / set）
+         var_others = var_others + c.var
       end
    end
+
+   -- c_varchar 的宽度：小行长时自动收窄（保证 alltypes 在 B≈320 时仍可用），大行固定 255；
+   -- 它不属于填充列，只是"内容长度确定的变长列"之一，所以宽度也进 var_known。
+   local varchar_w = 255
+   if b > 0 then
+      varchar_w = math.max(1, math.min(255, b - fixed - var_others - 2))
+   end
+   local var_known = var_others + varchar_w
 
    local target = 0
    local n = 0
@@ -280,23 +300,34 @@ local function alltypes_shape(b, profile)
              "（%d 字节）已经占满。最小可行 B ≈ %d",
              b, fixed, var_known, fixed + var_known + 2)
       end
-      local headroom = math.max(16, math.floor(target * 0.3))
-      n = target + headroom
+      n = target + math.max(16, math.floor(target * 0.3))
    end
 
-   -- 其它变长列（不含 c_varchar）也进实测表达式：内容长度固定 ⇒ 可预测
-   -- 实测表达式里的变长列：**排除填充列**（它由 fill 单独列出），否则会被算两次
+   -- 填充列类型：目标 ≤ 16 MiB 用 MEDIUMBLOB（容量按上限截断），否则 LONGBLOB（≤ 4 GiB）
+   local filler_ddl, filler_prefix
+   if target <= FILL_MEDIUMBLOB_MAX then
+      filler_ddl, filler_prefix = "MEDIUMBLOB", 3
+      if n > FILL_MEDIUMBLOB_MAX then n = FILL_MEDIUMBLOB_MAX end
+   elseif target <= FILL_LONGBLOB_MAX then
+      filler_ddl, filler_prefix = "LONGBLOB", 4
+   else
+      die("row-length 过大：c_pad 用 LONGBLOB 也只到 4 GiB（目标填充 %d 字节）", target)
+   end
+
+   -- 其它变长列（不含填充列）也进实测表达式：内容长度固定 ⇒ 可预测
    local var_cols = {}
    for _, c in ipairs(ALLTYPES) do
-      if c.var ~= nil and c.name ~= "c_varchar" then
+      if c.var ~= nil and c.name ~= FILL then
          var_cols[#var_cols + 1] = c.name
       end
    end
 
    local cols = {}
    for _, c in ipairs(ALLTYPES) do
-      if c.name == "c_varchar" then
-         cols[#cols + 1] = string.format("c_varchar VARCHAR(%d)", math.max(n, 1))
+      if c.name == FILL then
+         cols[#cols + 1] = FILL .. " " .. filler_ddl
+      elseif c.name == "c_varchar" then
+         cols[#cols + 1] = "c_varchar VARCHAR(" .. varchar_w .. ")"
       else
          cols[#cols + 1] = c.name .. " " .. c.ddl
       end
@@ -304,8 +335,7 @@ local function alltypes_shape(b, profile)
 
    local fill = {}
    if b > 0 then
-      fill[1] = {name = "c_varchar", capacity = n, prefix = (n < 256) and 1 or 2,
-                 target = target}
+      fill[1] = {name = FILL, capacity = n, prefix = filler_prefix, target = target}
    end
 
    local names = {}
@@ -324,8 +354,9 @@ local function alltypes_shape(b, profile)
          local v = {}
          local len = (b > 0) and lens[((i - 1) % #lens) + 1] or 0
          for _, c in ipairs(ALLTYPES) do
-            if c.name == "c_varchar" then
-               v[#v + 1] = "'" .. ascii_of(rng, len, "vr") .. "'"
+            if c.name == FILL then
+               -- ASCII 填充：1 字符 = 1 字节，LENGTH() 就是字节数
+               v[#v + 1] = "REPEAT('a'," .. len .. ")"
             else
                v[#v + 1] = c.gen(id, rng)
             end
@@ -562,7 +593,9 @@ local function cmd_prepare()
    local b = sysbench.opt.row_length
    local names = table_names()
    local shape = make_shape(b, sysbench.opt.index_profile, sysbench.opt.types)
-   local row_bytes = shape.fixed + ((shape.fill[1] ~= nil) and shape.fill[1].capacity or 0)
+   -- 批大小按**实际数据**估（fill.target）：c_pad 的声明容量是 16 MiB，拿它算会让批恒为 1；
+   -- 实际每行数据 ≈ target 字节，REPEAT() 的 SQL 文本很小，不会撞 max_allowed_packet。
+   local row_bytes = shape.fixed + ((shape.fill[1] ~= nil) and shape.fill[1].target or 0)
                   + (#shape.cols * 8)
 
    local con = connect()
