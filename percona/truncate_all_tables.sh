@@ -102,6 +102,7 @@ if [ -n "$ONLY" ]; then
 elif [ "$DISCOVER" -eq 1 ]; then
   first=${MEMBERS[0]:-}; [ -n "$first" ] || { echo "--discover 需要至少一个 --member" >&2; exit 2; }
   TABLES=$(q_quiet "${first%%:*}" "${first##*:}" "
+    SET SESSION group_concat_max_len = 1048576;
     SELECT COALESCE(GROUP_CONCAT(table_name ORDER BY CAST(SUBSTRING(table_name, LENGTH('$PREFIX')+1) AS UNSIGNED)), '')
       FROM information_schema.tables
      WHERE table_schema='$DB' AND table_name REGEXP '^${PREFIX}[0-9]+$';")
@@ -110,6 +111,18 @@ else
   TABLES=$(printf "${PREFIX}%d," $(seq 1 "$NTABLES")); TABLES=${TABLES%,}
 fi
 N=$(awk -F, '{print NF}' <<<"$TABLES")
+
+# 防御：GROUP_CONCAT 默认上限 1024 字节，128 张表会被截成「113 个整名 + 半截名」，
+# 于是清单悄悄少一半（实测 --dry-run 显示 [114/114] … `sbtest113`、`sb`）。
+# 发现模式下逐个校验名字形态：形态不对就直接失败，绝不少 TRUNCATE 一张。
+if [ -z "${ONLY:-}" ] && [ "${DISCOVER:-1}" -eq 1 ]; then
+  bad=$(awk -v p="$PREFIX" -F, '{for (i = 1; i <= NF; i++) if ($i !~ ("^" p "[0-9]+$")) print $i}' <<<"$TABLES" | head -3)
+  if [ -n "$bad" ]; then
+    echo "✗ 表清单不完整/非法（GROUP_CONCAT 被截断？）：$(tr '\n' ' ' <<<"$bad")" >&2
+    echo "  先把 group_concat_max_len 抬高再重试，或改用 --tables=N 显式给表名。" >&2
+    exit 2
+  fi
+fi
 
 # ── 定位 Leader ───────────────────────────────────────────────────────────
 if [ -z "$LEADER_PORT" ]; then
