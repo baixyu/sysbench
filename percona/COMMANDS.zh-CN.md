@@ -203,6 +203,26 @@ $SB src/lua/raft_prepare.lua --schema-db=perf --mysql-db=perf \
 `B` 最小约 312 字节，最大 4 GiB（≤16 MiB 用 `MEDIUMBLOB`，超出自动换 `LONGBLOB`）。
 例：`--types=all --row-length=262144`（256 KB 行）。
 
+### 4.1.1 `raft_bigrow_write.lua`：大行（BLOB）只写 workload
+
+打 `raft_prepare --types=all` 建的全类型表（`<prefix>N`，主键 `c_long`、载荷在 `c_pad`）。
+不用 `oltp_write_only`：后者的表名硬编码 `sbtest%d`、列固定 `id/k/c/pad` 且 `c` 只有 120 字符，
+既打不到 `at*` 也表达不了 256 KB 行。
+
+```bash
+$SB src/lua/raft_bigrow_write.lua --mysql-host=$LEADER --mysql-port=6606 \
+  --mysql-user=root --mysql-password=root --mysql-db=test --schema-db=test \
+  --table-prefix=at --tables=128 --table-size=1000 \
+  --row-length=262144 --threads=8 --time=600 --report-interval=1 --percentile=99 \
+  run
+```
+
+- 每事务默认 `big_update + small_update + delete_insert`（+BEGIN/COMMIT = 6 条 query），
+  `--ops=big_update` 可压成"每事务一条大行写"；`--payload-mode=sql|lua` 选择服务端/客户端生成载荷。
+- 受管写：按事务设 `percona_raft_request_id`；对 Raft 关闭的实例用 `--skip-trx`。
+- **信封**：256 KB 行、默认四语句 ⇒ 每事务约 1.25 MB 的 ROW 镜像，必须把
+  `percona_raft_max_envelope_bytes` 调到 ≥ 4194304，否则 COMMIT 报 8109。
+
 ### 4.2 `raft_verify.lua`：跨成员核对（一般用 §5 的包装脚本）
 
 ```bash
