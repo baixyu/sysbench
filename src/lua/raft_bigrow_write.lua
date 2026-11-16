@@ -79,6 +79,10 @@ local stmt_big_update, stmt_small_update, stmt_delete, stmt_insert
 local payload
 local seq = 0
 local db, fq
+-- <epoch>-c<CONNECTION_ID>：本连接本运行的唯一令牌
+local run_token
+local conn_id
+local stmt_begin, stmt_commit
 
 local function q(sql) con:query(sql) end
 
@@ -109,6 +113,13 @@ function thread_init()
          error("这台实例没有 percona_raft_request_namespace（不是 Raft 成员？）：" ..
                tostring(err) .. "；对 Raft 关闭的实例请用 --skip-trx", 0)
       end
+      -- 幂等键必须跨运行、跨连接都唯一：XID = f(cluster_uuid, namespace, request_id)，
+      -- 光靠 --time 重复跑同一批 id 会撞上上次留下的 XA（XAER_DUPID）。
+      -- 这里用 <epoch>-c<CONNECTION_ID()> 做运行令牌，再拼每线程的序号。
+      conn_id = tostring(con:query_row("SELECT CONNECTION_ID()"))
+      run_token = string.format("%d-c%s", os.time(), conn_id)
+      print(string.format("raft_bigrow_write.namespace=%s run_token=%s table=%s",
+                          sysbench.opt.request_namespace, run_token, fq))
    end
 
    if sysbench.opt.payload_mode == "lua" then
@@ -117,6 +128,10 @@ function thread_init()
 end
 
 function prepare_statements()
+   if not sysbench.opt.skip_trx then
+      stmt_begin = con:prepare("BEGIN")
+      stmt_commit = con:prepare("COMMIT")
+   end
    local pk = sysbench.opt.pk_column
    local blob = sysbench.opt.blob_column
    local small = sysbench.opt.small_column
@@ -155,9 +170,17 @@ function event()
    local small = sb_rand(0, 127)
 
    if not sysbench.opt.skip_trx then
-      q(string.format("SET SESSION percona_raft_request_id = '%s-%d-%d'",
-                      sysbench.opt.request_namespace, sysbench.tid, seq))
-      q("BEGIN")
+      local request_id = string.format("%s-n%d", run_token, seq)
+      if seq == 1 then
+         print(string.format(
+            "raft_bigrow_write.first_id tid=%s cid=%s ns=%s id=%s",
+            tostring(sysbench.tid), conn_id, sysbench.opt.request_namespace, request_id))
+      end
+      -- 与 oltp_common 一致：namespace 与 request_id 在**同一条** SET 里给出，紧贴 BEGIN。
+      q(string.format("SET SESSION percona_raft_request_namespace = '%s', " ..
+                      "SESSION percona_raft_request_id = '%s'",
+                      sysbench.opt.request_namespace, request_id))
+      stmt_begin:execute()
    end
 
    if stmt_big_update ~= nil then
@@ -192,7 +215,7 @@ function event()
    end
 
    if not sysbench.opt.skip_trx then
-      q("COMMIT")
+      stmt_commit:execute()
    end
 end
 
