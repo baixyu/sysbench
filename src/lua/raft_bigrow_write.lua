@@ -76,13 +76,16 @@ end
 
 local con
 local stmt_big_update, stmt_small_update, stmt_delete, stmt_insert
+local param_big_payload, param_big_pk
+local param_small_value, param_small_pk
+local param_delete_pk
+local param_insert_pk, param_insert_payload, param_insert_small
 local payload
+-- Unique per connection so reusing a request namespace across runs cannot
+-- reproduce an earlier request ID / prepared XID.
+local connection_token
 local seq = 0
 local db, fq
--- <epoch>-c<CONNECTION_ID>：本连接本运行的唯一令牌
-local run_token
-local conn_id
-local stmt_begin, stmt_commit
 
 local function q(sql) con:query(sql) end
 
@@ -105,6 +108,12 @@ function thread_init()
 
    -- 受管写身份：有这两个变量才是 Raft 成员；原生/预演实例上应当 --skip-trx
    if not sysbench.opt.skip_trx then
+      -- The namespace is a grouping label. Include a server-generated token
+      -- so reruns with the same namespace cannot reuse a prepared XID.
+      connection_token = con:query_row("SELECT REPLACE(UUID(), '-', '')")
+      if connection_token == nil or connection_token == "" then
+         error("cannot generate a unique request ID (SELECT UUID() failed)", 0)
+      end
       local ok, err = pcall(function()
          q(string.format("SET SESSION percona_raft_request_namespace = '%s'",
                          sysbench.opt.request_namespace))
@@ -113,25 +122,16 @@ function thread_init()
          error("这台实例没有 percona_raft_request_namespace（不是 Raft 成员？）：" ..
                tostring(err) .. "；对 Raft 关闭的实例请用 --skip-trx", 0)
       end
-      -- 幂等键必须跨运行、跨连接都唯一：XID = f(cluster_uuid, namespace, request_id)，
-      -- 光靠 --time 重复跑同一批 id 会撞上上次留下的 XA（XAER_DUPID）。
-      -- 这里用 <epoch>-c<CONNECTION_ID()> 做运行令牌，再拼每线程的序号。
-      conn_id = tostring(con:query_row("SELECT CONNECTION_ID()"))
-      run_token = string.format("%d-c%s", os.time(), conn_id)
-      print(string.format("raft_bigrow_write.namespace=%s run_token=%s table=%s",
-                          sysbench.opt.request_namespace, run_token, fq))
    end
 
    if sysbench.opt.payload_mode == "lua" then
       payload = string.rep("a", sysbench.opt.row_length)
    end
+
+   prepare_statements()
 end
 
 function prepare_statements()
-   if not sysbench.opt.skip_trx then
-      stmt_begin = con:prepare("BEGIN")
-      stmt_commit = con:prepare("COMMIT")
-   end
    local pk = sysbench.opt.pk_column
    local blob = sysbench.opt.blob_column
    local small = sysbench.opt.small_column
@@ -141,25 +141,46 @@ function prepare_statements()
       if sysbench.opt.payload_mode == "lua" then
          stmt_big_update = con:prepare(string.format(
             "UPDATE %s SET %s = ? WHERE %s = ?", fq, blob, pk))
+         param_big_payload = stmt_big_update:bind_create(
+            sysbench.sql.type.VARCHAR, len)
+         param_big_pk = stmt_big_update:bind_create(sysbench.sql.type.INT)
+         stmt_big_update:bind_param(param_big_payload, param_big_pk)
       else
          stmt_big_update = con:prepare(string.format(
             "UPDATE %s SET %s = REPEAT('a', %d) WHERE %s = ?", fq, blob, len, pk))
+         param_big_pk = stmt_big_update:bind_create(sysbench.sql.type.INT)
+         stmt_big_update:bind_param(param_big_pk)
       end
    end
    if has_op("small_update") then
       stmt_small_update = con:prepare(string.format(
          "UPDATE %s SET %s = ? WHERE %s = ?", fq, small, pk))
+      param_small_value = stmt_small_update:bind_create(sysbench.sql.type.TINYINT)
+      param_small_pk = stmt_small_update:bind_create(sysbench.sql.type.INT)
+      stmt_small_update:bind_param(param_small_value, param_small_pk)
    end
    if has_op("delete_insert") then
       stmt_delete = con:prepare(string.format(
          "DELETE FROM %s WHERE %s = ?", fq, pk))
+      param_delete_pk = stmt_delete:bind_create(sysbench.sql.type.INT)
+      stmt_delete:bind_param(param_delete_pk)
+
       if sysbench.opt.payload_mode == "lua" then
          stmt_insert = con:prepare(string.format(
             "INSERT INTO %s (%s, %s, %s) VALUES (?, ?, ?)", fq, pk, blob, small))
+         param_insert_pk = stmt_insert:bind_create(sysbench.sql.type.INT)
+         param_insert_payload = stmt_insert:bind_create(
+            sysbench.sql.type.VARCHAR, len)
+         param_insert_small = stmt_insert:bind_create(sysbench.sql.type.TINYINT)
+         stmt_insert:bind_param(param_insert_pk, param_insert_payload,
+                                param_insert_small)
       else
          stmt_insert = con:prepare(string.format(
             "INSERT INTO %s (%s, %s, %s) VALUES (?, REPEAT('a', %d), ?)",
             fq, pk, blob, small, len))
+         param_insert_pk = stmt_insert:bind_create(sysbench.sql.type.INT)
+         param_insert_small = stmt_insert:bind_create(sysbench.sql.type.TINYINT)
+         stmt_insert:bind_param(param_insert_pk, param_insert_small)
       end
    end
 end
@@ -170,55 +191,51 @@ function event()
    local small = sb_rand(0, 127)
 
    if not sysbench.opt.skip_trx then
-      local request_id = string.format("%s-n%d", run_token, seq)
-      if seq == 1 then
-         print(string.format(
-            "raft_bigrow_write.first_id tid=%s cid=%s ns=%s id=%s",
-            tostring(sysbench.tid), conn_id, sysbench.opt.request_namespace, request_id))
-      end
-      -- 与 oltp_common 一致：namespace 与 request_id 在**同一条** SET 里给出，紧贴 BEGIN。
-      q(string.format("SET SESSION percona_raft_request_namespace = '%s', " ..
-                      "SESSION percona_raft_request_id = '%s'",
-                      sysbench.opt.request_namespace, request_id))
-      stmt_begin:execute()
+      local request_id = string.format("%s-t%d-n%d",
+                                       connection_token, sysbench.tid, seq)
+      q(string.format("SET SESSION percona_raft_request_id = '%s'",
+                      request_id))
+      q("BEGIN")
    end
 
    if stmt_big_update ~= nil then
       if sysbench.opt.payload_mode == "lua" then
-         stmt_big_update:bind(1, payload)
-         stmt_big_update:bind(2, pk)
-      else
-         stmt_big_update:bind(1, pk)
+         param_big_payload:set(payload)
       end
+      param_big_pk:set(pk)
       stmt_big_update:execute()
    end
 
    if stmt_small_update ~= nil then
-      stmt_small_update:bind(1, small)
-      stmt_small_update:bind(2, pk)
+      param_small_value:set(small)
+      param_small_pk:set(pk)
       stmt_small_update:execute()
    end
 
    if stmt_delete ~= nil then
-      stmt_delete:bind(1, pk)
+      param_delete_pk:set(pk)
       stmt_delete:execute()
       -- 删了要补回来，否则表会越跑越空、主键范围落空
       if sysbench.opt.payload_mode == "lua" then
-         stmt_insert:bind(1, pk)
-         stmt_insert:bind(2, payload)
-         stmt_insert:bind(3, small)
+         param_insert_pk:set(pk)
+         param_insert_payload:set(payload)
+         param_insert_small:set(small)
       else
-         stmt_insert:bind(1, pk)
-         stmt_insert:bind(2, small)
+         param_insert_pk:set(pk)
+         param_insert_small:set(small)
       end
       stmt_insert:execute()
    end
 
    if not sysbench.opt.skip_trx then
-      stmt_commit:execute()
+      q("COMMIT")
    end
 end
 
 function thread_done()
+   if stmt_big_update ~= nil then stmt_big_update:close() end
+   if stmt_small_update ~= nil then stmt_small_update:close() end
+   if stmt_delete ~= nil then stmt_delete:close() end
+   if stmt_insert ~= nil then stmt_insert:close() end
    if con ~= nil then con:disconnect() end
 end

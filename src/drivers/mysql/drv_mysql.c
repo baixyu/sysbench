@@ -115,7 +115,8 @@ typedef struct
   unsigned char      txn_open;           /* 本连接当前有一笔事务开着（显式或隐式） */
   unsigned char      target_mismatch;    /* --target=raft 但服务端没有身份变量 */
   unsigned char      read_consistency_failed;  /* 要强读但服务端设不上（非 Raft 实例） */
-  unsigned long long txn_seq;            /* 本连接已开始的受管事务数 */
+  unsigned long long txn_seq; /* per-connection sequence for auto-generated IDs */
+  unsigned char      request_id_explicit_pending; /* caller set an ID for the next transaction */
 } db_mysql_conn_t;
 
 /*
@@ -357,6 +358,59 @@ static int raft_is_txn_end(const char *query, size_t len)
   return strcmp(word, "commit") == 0 || strcmp(word, "rollback") == 0;
 }
 
+/* Caller-supplied request IDs take precedence over driver-generated IDs. */
+static int raft_is_request_id_assignment(const char *query, size_t len)
+{
+  static const char variable[] = "percona_raft_request_id";
+  const size_t variable_len = sizeof(variable) - 1;
+  char word[16];
+
+  if (query == NULL)
+    return 0;
+
+  raft_first_word(query, len, word, sizeof(word));
+  if (strcmp(word, "set") != 0)
+    return 0;
+
+  for (size_t i = 0; i + variable_len <= len; i++)
+  {
+    if (i > 0)
+    {
+      const unsigned char previous = (unsigned char) query[i - 1];
+      if ((previous >= 'a' && previous <= 'z') ||
+          (previous >= 'A' && previous <= 'Z') ||
+          (previous >= '0' && previous <= '9') ||
+          previous == '_' || previous == '$')
+        continue;
+    }
+
+    size_t j = 0;
+    for (; j < variable_len; j++)
+    {
+      unsigned char actual = (unsigned char) query[i + j];
+      if (actual >= 'A' && actual <= 'Z')
+        actual = (unsigned char) (actual - 'A' + 'a');
+      if (actual != (unsigned char) variable[j])
+        break;
+    }
+    if (j != variable_len)
+      continue;
+
+    size_t end = i + variable_len;
+    if (end < len && query[end] == 0x60)
+      end++;
+    while (end < len && (query[end] == 0x20 || query[end] == 0x09 ||
+                         query[end] == 0x0a || query[end] == 0x0d))
+      end++;
+    if (end < len &&
+        (query[end] == '=' ||
+         (query[end] == ':' && end + 1 < len && query[end + 1] == '=')))
+      return 1;
+  }
+
+  return 0;
+}
+
 /*
   写语句判定：**只用于"要不要替脚本开一笔自动提交事务"**，与准入判定无关。
   受管契约本身由服务端判（单表 + 显式 BEGIN + 身份），这里只是把自动提交翻译成等价形状。
@@ -393,8 +447,8 @@ static int raft_implicit_begin_if_needed(db_mysql_conn_t *c, const char *query, 
 
   if (raft_is_txn_start(query, len))
   {
-    raft_set_request_id(c);          /* 身份必须在 BEGIN 之前设 */
-    c->txn_open = 1;
+    if (!c->request_id_explicit_pending)
+      raft_set_request_id(c);          /* 身份必须在 BEGIN 之前设 */
     return 0;
   }
 
@@ -410,7 +464,8 @@ static int raft_implicit_begin_if_needed(db_mysql_conn_t *c, const char *query, 
   if (!raft_is_write_statement(query, len))
     return 0;                        /* 读语句不受管，也不需要事务 */
 
-  raft_set_request_id(c);
+  if (!c->request_id_explicit_pending)
+    raft_set_request_id(c);
 
   if (raft_run_sql(c->mysql, "BEGIN") != 0)
   {
@@ -419,6 +474,7 @@ static int raft_implicit_begin_if_needed(db_mysql_conn_t *c, const char *query, 
     return -1;                       /* 调用方用 check_error() 上报并分类 */
   }
 
+  c->request_id_explicit_pending = 0;
   c->txn_open = 1;
   raft_bump(&raft_implicit_txns);
 
@@ -1230,6 +1286,17 @@ db_error_t mysql_drv_execute(db_stmt_t *stmt, db_result_t *rs)
                          &rs->counter);
     }
 
+    if (stmt->query != NULL &&
+        raft_is_txn_start(stmt->query, strlen(stmt->query)))
+    {
+      db_mysql_con->txn_open = 1;
+      db_mysql_con->request_id_explicit_pending = 0;
+    }
+
+    if (db_mysql_con->managed_identity && stmt->query != NULL &&
+        raft_is_request_id_assignment(stmt->query, strlen(stmt->query)))
+      db_mysql_con->request_id_explicit_pending = 1;
+
     if (implicit && raft_implicit_finish(db_mysql_con, 1) != 0)
       return check_error(con, "mysql_stmt_execute(COMMIT)", "COMMIT",
                          &rs->counter);
@@ -1339,6 +1406,16 @@ db_error_t mysql_drv_query(db_conn_t *sb_conn, const char *query, size_t len,
       raft_implicit_finish(db_mysql_con, 0);
     return check_error(sb_conn, "mysql_drv_query()", query, &rs->counter);
   }
+
+  if (raft_is_txn_start(query, len))
+  {
+    db_mysql_con->txn_open = 1;
+    db_mysql_con->request_id_explicit_pending = 0;
+  }
+
+  if (db_mysql_con->managed_identity &&
+      raft_is_request_id_assignment(query, len))
+    db_mysql_con->request_id_explicit_pending = 1;
 
   /*
     语句成了、COMMIT 没成 —— 这笔事务**没有**提交，客户端必须知道：
