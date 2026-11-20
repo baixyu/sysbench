@@ -369,7 +369,7 @@ $SB src/lua/oltp_write_only.lua --mysql-host=127.0.0.1 --mysql-port=$LEADER \
 ```bash
 bash percona/verify_all_tables.sh --sysbench=$SB --schema-db=$DB \
   --table-prefix=sbtest --tables=64 \
-  --member 10.188.62.79:6606 --member 10.214.38.209:6606 --member 10.188.48.140:6606 \
+  --member 127.0.0.1:6606 --member 127.0.0.1:6606 --member 127.0.0.1:6606 \
   --user=root --password=root
 # 表名不止 <prefix>N 时就用 --discover（从 information_schema 按 ^prefix[0-9]+$ 发现）
 #   bash percona/verify_all_tables.sh ... --discover
@@ -409,7 +409,7 @@ bash percona/raft_schema.sh --sysbench=$SB --schema-db=perf --schema-tables=t,t2
 
 ```bash
 bash percona/monitor.sh --sysbench=$SB \
-  --member 10.188.62.79:6606 --member 10.214.38.209:6606 --member 10.188.48.140:6606 \
+  --member 127.0.0.1:6606 --member 127.0.0.1:6606 --member 127.0.0.1:6606 \
   --user=root --password='root' --interval-ms=1000 --network-probes --lock-waits --lock-interval-ms=250 \
   --out-dir=/tmp/raft-mon --tag=load \
   -- bash percona/prepare.sh --sysbench=$SB --schema-db=test --mysql-db=test ...
@@ -529,7 +529,7 @@ bash percona/prepare.sh --sysbench=$SB --schema-db=$DB --mysql-db=$DB \
 bash percona/concurrency_matrix.sh \
   --sysbench=$SB --leader-host=$LEADER --leader-port=6606 \
   --leader-user=root --leader-password=root \
-  --member 10.188.62.79:6606 --member 10.214.38.209:6606 --member 10.188.48.140:6606 \
+  --member 127.0.0.1:6606 --member 127.0.0.1:6606 --member 127.0.0.1:6606 \
   --mysql-db=$DB --tables=64 --table-size=200000 \
   --threads=4-128:2 --time=60 --scenarios=ro,linro,wo,rw \
   --host-metrics --node-exporter-port=9100 \
@@ -555,12 +555,12 @@ bash percona/concurrency_matrix.sh \
 ```bash
 # ① 先看清单（不执行）
 bash percona/truncate_all_tables.sh --schema-db=$DB --table-prefix=sbtest --tables=64 \
-  --member 10.188.62.79:6606 --member 10.214.38.209:6606 --member 10.188.48.140:6606 \
+  --member 127.0.0.1:6606 --member 127.0.0.1:6606 --member 127.0.0.1:6606 \
   --user=root --password=root --dry-run
 
 # ② 确认后执行（自动从 --member 里找 Leader；执行完等各成员 epoch 追平）
 bash percona/truncate_all_tables.sh --schema-db=$DB --table-prefix=sbtest --tables=64 \
-  --member 10.188.62.79:6606 --member 10.214.38.209:6606 --member 10.188.48.140:6606 \
+  --member 127.0.0.1:6606 --member 127.0.0.1:6606 --member 127.0.0.1:6606 \
   --user=root --password=root --yes
 ```
 
@@ -578,7 +578,7 @@ bash percona/truncate_all_tables.sh --schema-db=$DB --table-prefix=sbtest --tabl
 
 ```bash
 bash percona/drop_all_tables.sh --schema-db=$DB --table-prefix=sbtest \
-  --member 10.188.62.79:6606 --member 10.214.38.209:6606 --member 10.188.48.140:6606 \
+  --member 127.0.0.1:6606 --member 127.0.0.1:6606 --member 127.0.0.1:6606 \
   --user=root --password=root --dry-run     # 先看清单；确认后把 --dry-run 换成 --yes
 ```
 
