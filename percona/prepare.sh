@@ -3,14 +3,14 @@
 # prepare.sh —— 一条命令把"建表（受管 transition）"和"灌数"合并：
 #   ① `raft_prepare.lua ddl` 现算目标形状（与灌数用同一套参数，不重复实现形状逻辑）
 #   ② 对集群上**还不存在**的表，按声明顺序逐张走单参数 PERCONA_RAFT_SCHEMA_TRANSITION(ddl)
-#      （复用 raft_schema.sh：预检 → 预演实例提供独立期望指纹 → 对 Leader 提案 → 逐成员核对）
+#      （复用 raft_schema.sh：Leader 侧预检 → 对 Leader 提案 → 逐成员核对）
 #   ③ 全部就位后跑 `raft_prepare.lua prepare --skip-ddl`（灌数 + 行长回读）
 #
 # 依据：percona-server 的 Docs/raft_replication/perf_tool_plan.md §6.5（活集群加/改表；一次只加一张表，
 #       目标清单的顺序就是声明顺序）与 §4（形状 / 行长口径）。
 #
 # 为什么是 wrapper 而不是改 Lua：Lua 层一次进程只能连**一个**端点；提案必须打在 **Leader**，
-# 而预演实例用于预检和独立指纹核对。服务端自己从单参数 DDL 推导目标 manifest。
+# 目标 manifest 由服务端从单参数 DDL 推导，wrapper 再做逐成员核对。
 #   `--schema-tables` 是客户端核对用的完整目标清单（PERCONA_RAFT_SCHEMA_MANIFEST 按给定清单派生），
 #   必须按声明顺序提供，与 raft_schema.sh 的校验约定一致。
 #
@@ -19,7 +19,6 @@
 #     --schema-db=perf --mysql-db=perf \
 #     --schema-tables=t,sbtest1,prep1,prep2 \        # 完整目标清单（= 在册的现有基表 + 待建的表）；缺省= 自动发现现有基表
 #     --table-prefix=prep --tables=2 --table-size=2000 --row-length=400 --seed=42 \
-#     --preview-host=127.0.0.1 --preview-port=48104 --preview-user=root \
 #     --member 127.0.0.1:48101 --member 127.0.0.1:48102 --member 127.0.0.1:48103 \
 #     --verify
 #
@@ -36,14 +35,8 @@
 # 选项：
 #   --mysql-cli-args="..."  原样追加给 mysql 客户端（例：--get-server-public-key / --ssl-mode=REQUIRED）
 #   --sysbench-args="..."   原样追加给所有 sysbench 调用（例：--mysql-ssl=on；也会透传给 raft_schema.sh/verify.sh）
-#   --preview-password=PW   预演实例的密码（缺省取 MYSQL_PWD）
 #   --leader-password=PW    Leader/成员 的密码（缺省取 MYSQL_PWD）
 #   --existing-tables=a,b   显式给出"在 force"的表集合（预检用；缺省= 清单里已存在的前缀）
-#   --preview-reset         在 preview 前先 DROP 预演实例上**同名**的目标表，让 preview 真正执行本次
-#                           DDL。为什么需要：若预演实例上残留了一张旧参数建的 sbtestN，脚本会给它加
-#                           --skip-ddl，preview 便照着旧表派生期望指纹，与集群按本次 DDL 新建的表不符
-#                           ⇒ propose 已 APPLIED 却在核对环节 FATAL（实测报"本机派生指纹与目标不一致"）。
-#                           DROP 只动预演实例（Raft 关闭的草稿实例），不影响集群。
 #   --load-threads=N        并发灌数线程数（默认 1）。每个线程只插自己那段 id 分片：
 #                           id 范围 [floor(total*(k-1)/N)+1, floor(total*k/N)]，各自独立连接。
 #                           N>1 时必须 --skip-ddl（建表要事先完成），行长回读在所有线程
@@ -86,10 +79,8 @@ EXISTING_GIVEN=0
 TABLE_PREFIX=sbtest
 TABLES=
 SHAPE_ARGS=()          # 原样转发给 raft_prepare.lua 的参数
-PREVIEW_HOST=127.0.0.1; PREVIEW_PORT=; PREVIEW_USER=root
 LEADER_HOST=127.0.0.1;  LEADER_PORT=;  LEADER_USER=root
-# 密码：显式 --preview-password/--leader-password，或用 MYSQL_PWD 环境变量一次性给两边
-PREVIEW_PASSWORD=${MYSQL_PWD:-}
+# 密码：显式 --leader-password，或用 MYSQL_PWD 环境变量
 LEADER_PASSWORD=${MYSQL_PWD:-}
 # 逃生口：原样追加给 mysql 客户端 / sysbench 的额外参数（分词规则同 shell）
 # 例：MYSQL_CLI_ARGS='--get-server-public-key' 或 '--ssl-mode=REQUIRED'
@@ -101,7 +92,6 @@ SKIP_DDL=0; SKIP_LOAD=0; DO_VERIFY=0; WAIT_APPLIED=1; ALLOW_NONEMPTY=0
 LOAD_THREADS=1
 MONITOR=0; MONITOR_INTERVAL_MS=1000; MONITOR_RING_INTERVAL_MS=250; MONITOR_OUT_DIR=
 MONITOR_HOST_METRICS=0; MONITOR_HOST_INTERVAL_MS=1000; MONITOR_NODE_EXPORTER_PORT=9100; MONITOR_PROMETHEUS_URL=
-PREVIEW_RESET=0
 MONITOR_NODE_EXPORTER_URLS=(); MONITOR_PROMETHEUS_INSTANCES=()
 
 while [[ $# -gt 0 ]]; do
@@ -119,10 +109,8 @@ while [[ $# -gt 0 ]]; do
     --tables) TABLES=$2; SHAPE_ARGS+=(--tables="$2"); shift 2;;
     --table-size|--row-length|--types|--index-profile|--seed|--batch|--rowlen-tolerance)
       SHAPE_ARGS+=("$1=$2"); shift 2;;
-    --preview-host) PREVIEW_HOST=$2; shift 2;;
-    --preview-port) PREVIEW_PORT=$2; shift 2;;
-    --preview-user) PREVIEW_USER=$2; shift 2;;
-    --preview-password) PREVIEW_PASSWORD=$2; shift 2;;
+    --preview-host|--preview-port|--preview-user|--preview-password|--preview-reset)
+      echo "已移除 --preview-*：建表不再需要预演实例（preview）" >&2; exit 2;;
     --leader-host) LEADER_HOST=$2; shift 2;;
     --leader-port) LEADER_PORT=$2; shift 2;;
     --leader-user) LEADER_USER=$2; shift 2;;
@@ -132,7 +120,6 @@ while [[ $# -gt 0 ]]; do
     --member) MEMBERS+=("$2"); shift 2;;
     --skip-ddl) SKIP_DDL=1; shift;;
     --load-threads) LOAD_THREADS=$2; shift 2;;
-    --preview-reset) PREVIEW_RESET=1; shift;;
     --skip-load) SKIP_LOAD=1; shift;;
     --verify) DO_VERIFY=1; shift;;
     --allow-nonempty) ALLOW_NONEMPTY=1; shift;;
@@ -154,7 +141,6 @@ done
 
 [[ -n "$SCHEMA_DB" ]] || { echo "必须给 --schema-db" >&2; exit 2; }
 [[ -n "$MYSQL_DB" ]] || MYSQL_DB=$SCHEMA_DB
-[[ -n "$PREVIEW_PORT" ]] || { echo "必须给 --preview-port（Raft 关闭、与集群同 schema 的预演实例）" >&2; exit 2; }
 [[ -x "$SYSBENCH" || -n "$(command -v "$SYSBENCH" 2>/dev/null || true)" ]] || \
   { echo "找不到 sysbench：$SYSBENCH" >&2; exit 2; }
 [[ -r "$LUA_PREPARE" ]] || { echo "找不到 $LUA_PREPARE" >&2; exit 2; }
@@ -194,15 +180,6 @@ cli() { # <host> <port> <user> <password> <mysql 参数…>
 # 对 Leader 执行一条语句（返回制表符分隔的行）
 q() { # <port> <sql>
   cli "$LEADER_HOST" "$1" "$LEADER_USER" "$LEADER_PASSWORD" -Nse "$2"
-}
-
-# 预演实例上是否已经有这张表：上一次失败的尝试可能已经把 DDL 在预演实例上执行过了，
-# 再执行一次会撞 1050（表已存在）⇒ 这种情况给 raft_schema.sh 传 --skip-ddl（它就是为这个准备的）。
-preview_has_table() { # <table>
-  local n
-  n=$(cli "$PREVIEW_HOST" "$PREVIEW_PORT" "$PREVIEW_USER" "$PREVIEW_PASSWORD" -Nse \
-      "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$SCHEMA_DB' AND table_name='$1'" 2>/dev/null)
-  [[ "$n" == "1" ]]
 }
 
 leader_port_probe() { # 从 --member 里挑 state=LEADER 的那台
@@ -249,7 +226,6 @@ if [[ $MONITOR -eq 1 && -z "${RAFT_MONITOR_WRAPPED:-}" ]]; then
       --monitor-host-metrics|--no-monitor-host-metrics) continue;;
       --monitor-host-interval-ms|--monitor-node-exporter-port|--monitor-prometheus-url) skip_next=1; continue;;
       --monitor-node-exporter-url|--monitor-prometheus-instance) skip_next=1; continue;;
-      --preview-reset) continue;;
       --monitor-out-dir) skip_next=1; continue;;
       *) forward+=("$a");;
     esac
@@ -258,8 +234,8 @@ if [[ $MONITOR -eq 1 && -z "${RAFT_MONITOR_WRAPPED:-}" ]]; then
   exec env RAFT_MONITOR_WRAPPED=1 bash "$MONITOR_SCRIPT" "${m_args[@]}" -- "$0" ${forward[@]+"${forward[@]}"}
 fi
 
-echo "=== 0) 连接：Leader ${LEADER_HOST}:${LEADER_PORT}（用户 ${LEADER_USER}）、预演实例 ${PREVIEW_HOST}:${PREVIEW_PORT}（用户 ${PREVIEW_USER}）、成员 ${#MEMBERS[@]} 个 ==="
-echo "    步骤顺序：① 算 DDL（不连库）→ ② 读 Leader 的 information_schema 发现已有基表 → ③ 逐张单参数 transition（预演实例提供独立期望指纹）→ ④ 灌数 + 行长回读（Leader）→ ⑤ 跨成员核对"
+echo "=== 0) 连接：Leader ${LEADER_HOST}:${LEADER_PORT}（用户 ${LEADER_USER}）、成员 ${#MEMBERS[@]} 个 ==="
+echo "    步骤顺序：① 算 DDL（不连库）→ ② 读 Leader 的 information_schema 发现已有基表 → ③ 逐张单参数 transition（服务端派生目标 manifest）→ ④ 灌数 + 行长回读（Leader）→ ⑤ 跨成员核对"
 
 # ── 1) 目标形状（DDL）────────────────────────────────────────────────────────
 echo "=== 1) 现算目标 DDL（raft_prepare.lua ddl）==="
@@ -319,8 +295,7 @@ rc=$?
 [[ $rc -eq 0 ]] || {
   echo "读 ${SCHEMA_DB} 的现有基表失败（Leader ${LEADER_HOST}:${LEADER_PORT}，用户 ${LEADER_USER}）：" >&2
   echo "$existing_rows" >&2
-  echo "  —— 这一步连的是 **Leader**（用 --leader-host/--leader-port 指定，或用 --member 自动探测）；" >&2
-  echo "     预演实例（--preview-host/--preview-port）要到逐张 transition 时才用。" >&2
+  echo "  —— 这一步连的是 **Leader**（用 --leader-host/--leader-port 指定，或用 --member 自动探测）。" >&2
   exit 1; }
 EXISTING_DISCOVERED=""
 for e in $existing_rows; do EXISTING_DISCOVERED="${EXISTING_DISCOVERED:+$EXISTING_DISCOVERED,}$e"; done
@@ -453,25 +428,10 @@ else
       rs_args=(--sysbench="$SYSBENCH" --schema-db="$SCHEMA_DB" \
                --schema-tables="${FINAL_LOCAL:+$FINAL_LOCAL,}$t" \
                --ddl="$ddl" \
-               --preview-host="$PREVIEW_HOST" --preview-port="$PREVIEW_PORT" --preview-user="$PREVIEW_USER" \
                --leader-host="$LEADER_HOST" --leader-port="$LEADER_PORT" --leader-user="$LEADER_USER")
       [[ -n "$FINAL_LOCAL" ]] && rs_args+=(--existing-tables="$FINAL_LOCAL")
-      [[ -n "$PREVIEW_PASSWORD" ]] && rs_args+=(--preview-password="$PREVIEW_PASSWORD")
       [[ -n "$LEADER_PASSWORD" ]] && rs_args+=(--leader-password="$LEADER_PASSWORD")
       [[ ${#SB_EXTRA_STR[@]} -gt 0 ]] && rs_args+=(--sysbench-args="${SB_EXTRA_STR[*]}")
-      if preview_has_table "$t"; then
-        if [[ "$PREVIEW_RESET" -eq 1 ]]; then
-          echo "   （--preview-reset：先删掉预演实例上残留的 $t，让 preview 按本次 DDL 重新建）"
-          cli "$PREVIEW_HOST" "$PREVIEW_PORT" "$PREVIEW_USER" "$PREVIEW_PASSWORD" \
-              -e "DROP TABLE IF EXISTS \`$SCHEMA_DB\`.\`$t\`" >/dev/null 2>&1 \
-            || { echo "预演实例上 DROP $t 失败" >&2; exit 1; }
-        else
-          echo "   （预演实例上已有 $t ⇒ 传 --skip-ddl，避免重复执行 DDL）"
-          echo "     注意：若这张表是**旧参数**建的（例如 --row-length/--types 变过），preview 派生的期望指纹会与集群不符，"
-          echo "           典型症状是 propose 已 APPLIED 却在核对时报'本机派生指纹与目标不一致'；此时加 --preview-reset 重跑即可。" >&2
-          rs_args+=(--skip-ddl)
-        fi
-      fi
       [[ $WAIT_APPLIED -eq 1 ]] && rs_args+=(--wait-applied)
       for m in "${MEMBERS[@]}"; do rs_args+=(--member "$m"); done
       "$SCHEMA_SCRIPT" "${rs_args[@]}" || {

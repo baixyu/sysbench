@@ -34,7 +34,7 @@ LEADER=$PORT
 
 | 脚本 | 参数 | 默认 |
 | --- | --- | --- |
-| `prepare.sh`、`raft_schema.sh` | `--preview-user` / `--preview-password`（预演实例）、`--leader-user` / `--leader-password`（Leader 与各成员） | `root`，密码取 `MYSQL_PWD` |
+| `prepare.sh`、`raft_schema.sh` | `--leader-user` / `--leader-password`（Leader 与各成员） | `root`，密码取 `MYSQL_PWD` |
 | `verify.sh` | `--user=` / `--password=` | 同上 |
 | `doctor.sh` | `--target-user/--target-password`、`--preview-user/--preview-password` | 同上 |
 | `report.sh` | `--mysql-user=` / `--mysql-password=` | 同上 |
@@ -44,8 +44,8 @@ LEADER=$PORT
 `--mysql-password=`，它会出现在 `ps` 里 —— 在意的话就用 `MYSQL_PWD`。
 
 实测（2026-10-14，一个 `rafter`/`pw123` 的实例）：不给密码 ⇒ `ERROR 1045 Access denied`（客户端与
-sysbench 两条路都会拒）；`--leader-password/--preview-password` 与 `MYSQL_PWD` 两种给法都能过
-（自动发现、预检、预演实例执行 DDL 并派生指纹、`verify.sh` 聚合 `verify.result=PASS`、
+sysbench 两条路都会拒）；`--leader-password` 与 `MYSQL_PWD` 两种给法都能过
+（自动发现、预检、Leader 提案并逐成员核对、`verify.sh` 聚合 `verify.result=PASS`、
 `doctor.sh` `check1_connect=PASS`）。
 
 **逃生口**（连接层以外的参数原样往下传，分词规则同 shell）：
@@ -168,7 +168,6 @@ FP=$(python3  -c "import json,sys; print(json.loads(sys.argv[1])['fingerprint'])
 # ⑤ 测试表**不用手工建**：一条命令让工具从这张 genesis 表涨到 N 张（见 §5）
 bash percona/prepare.sh --sysbench=$SB --schema-db=perf --mysql-db=perf \
   --table-prefix=sbtest --tables=4 --table-size=500 --row-length=400 \
-  --preview-host=127.0.0.1 --preview-port=48204 \
   --member 127.0.0.1:48201 --member 127.0.0.1:48202 --member 127.0.0.1:48203 --verify
 ```
 
@@ -397,10 +396,9 @@ bash percona/doctor.sh --sysbench=$SB \
   --preview-host=127.0.0.1 --preview-port=43704 --preview-user=root \
   --require-raft --golden-dir=./schemas/golden
 
-# 活集群加/改表（预演实例提供独立期望指纹 → 单参数 DDL 提案 → 三台核对）
+# 活集群加/改表（Leader 侧预检 → 单参数 DDL 提案 → 三台核对）
 bash percona/raft_schema.sh --sysbench=$SB --schema-db=perf --schema-tables=t,t2 \
   --ddl="CREATE TABLE perf.t2 (id INT PRIMARY KEY, v INT NOT NULL)" \
-  --preview-host=127.0.0.1 --preview-port=43704 --preview-user=root \
   --leader-host=127.0.0.1 --leader-port=$LEADER --leader-user=root \
   --member 127.0.0.1:43701 --member 127.0.0.1:43702 --member 127.0.0.1:43703 --wait-applied
 ```
@@ -474,7 +472,6 @@ MYSQL_CLI=<build>/runtime_output_directory/mysql \
 bash percona/prepare.sh --sysbench=$SB \
   --schema-db=perf --mysql-db=perf \
   --table-prefix=sbtest --tables=8 --table-size=1000000 --row-length=400 --seed=42 \
-  --preview-host=127.0.0.1 --preview-port=48104 --preview-user=root \
   --member 127.0.0.1:48101 --member 127.0.0.1:48102 --member 127.0.0.1:48103 \
   --verify                                      # 结束时做跨成员聚合核对
 ```
@@ -508,7 +505,7 @@ bash percona/prepare.sh --sysbench=$SB \
 ```bash
 bash percona/prepare.sh --sysbench=$SB --schema-db=$DB --mysql-db=$DB \
   --table-prefix=sbtest --tables=128 --table-size=200000 --row-length=400 --seed=42 \
-  --preview-host=... --leader-host=$LEADER --member ... \
+  --leader-host=$LEADER --member ... \
   --skip-ddl --load-threads=8
 ```
 
@@ -670,14 +667,13 @@ $MYSQL -h127.0.0.1 -P$LEADER -uroot perf -e \
   "SELECT PERCONA_RAFT_SCHEMA_TRANSITION('CREATE TABLE perf.t2 (id INT PRIMARY KEY, v INT NOT NULL)') AS transition_result\G"
 ```
 
-服务端在每个成员 apply 后校验实际 schema；也可用 §5 的 `percona/raft_schema.sh` 做预检和独立指纹核对。该 wrapper 的 `--schema-tables` 是**目标**清单，仅供客户端派生期望指纹；新增表仍须与 DDL 同名。
+服务端在每个成员 apply 后校验实际 schema；也可用 §5 的 `percona/raft_schema.sh` 做 Leader 侧预检和逐成员核对。该 wrapper 的 `--schema-tables` 是**目标**清单，供客户端在提案后逐成员派生比对；新增表仍须与 DDL 同名。
 
-TRUNCATE 示例通过同一个单参数接口执行。`--schema-tables` 按完整 in-force 顺序填写；wrapper 会跳过预演实例上的 TRUNCATE，只在那里读取期望指纹：
+TRUNCATE 示例通过同一个单参数接口执行。`--schema-tables` 按完整 in-force 顺序填写；TRUNCATE 不改变 schema，wrapper 直接提案：
 
 ```bash
 bash percona/raft_schema.sh --sysbench=$SB --schema-db=perf --schema-tables=t,t2 \
   --ddl="TRUNCATE TABLE perf.t2" \
-  --preview-host=127.0.0.1 --preview-port=43704 --preview-user=root \
   --leader-host=127.0.0.1 --leader-port=$LEADER --leader-user=root \
   --member 127.0.0.1:43701 --member 127.0.0.1:43702 --member 127.0.0.1:43703 \
   --wait-applied
